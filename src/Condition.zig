@@ -38,18 +38,11 @@ pub fn wait(c: *Condition, io: Io, mutex: *Mutex) Cancelable!void {
     mutex.lockUncancelable(io);
 }
 
-/// Like `wait`, but ignores cancellation.
-pub fn waitUncancelable(c: *Condition, io: Io, mutex: *Mutex) void {
-    var w: Node = .{ .io = io };
-    _ = c.queue.push(&w, .queue);
-    mutex.unlock(io);
-    w.waitUncancelable();
-    mutex.lockUncancelable(io);
-}
+pub const WaitTimeoutError = Cancelable || Io.Timeout.Error;
 
 /// Like `wait`, but returns `error.Timeout` if no signal arrives before
 /// `timeout` elapses. The mutex is held on every return path.
-pub fn timedWait(c: *Condition, io: Io, mutex: *Mutex, timeout: Io.Timeout) (error{Timeout} || Cancelable)!void {
+pub fn waitTimeout(c: *Condition, io: Io, mutex: *Mutex, timeout: Io.Timeout) WaitTimeoutError!void {
     if (timeout == .none) return c.wait(io, mutex);
 
     var w: Node = .{ .io = io };
@@ -72,6 +65,15 @@ pub fn timedWait(c: *Condition, io: Io, mutex: *Mutex, timeout: Io.Timeout) (err
 
     mutex.lockUncancelable(io);
     if (timed_out) return error.Timeout;
+}
+
+/// Like `wait`, but ignores cancellation.
+pub fn waitUncancelable(c: *Condition, io: Io, mutex: *Mutex) void {
+    var w: Node = .{ .io = io };
+    _ = c.queue.push(&w, .queue);
+    mutex.unlock(io);
+    w.waitUncancelable();
+    mutex.lockUncancelable(io);
 }
 
 /// Wakes one waiter, if any.
@@ -148,10 +150,10 @@ test "broadcast wakes all" {
     cond.broadcast(io);
 
     try group.await(io);
-    try std.testing.expectEqual(@as(u32, 3), woken.load(.monotonic));
+    try std.testing.expectEqual(3, woken.load(.monotonic));
 }
 
-test "timedWait times out" {
+test "waitTimeout times out" {
     const io = std.testing.io;
 
     var m: Mutex = .init;
@@ -161,5 +163,5 @@ test "timedWait times out" {
     defer m.unlock(io);
 
     const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } };
-    try std.testing.expectError(error.Timeout, cond.timedWait(io, &m, timeout));
+    try std.testing.expectError(error.Timeout, cond.waitTimeout(io, &m, timeout));
 }

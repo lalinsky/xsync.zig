@@ -93,5 +93,5 @@ test "concurrent counter" {
     }
     try group.await(io);
 
-    try std.testing.expectEqual(@as(u64, 4000), counter);
+    try std.testing.expectEqual(4000, counter);
 }

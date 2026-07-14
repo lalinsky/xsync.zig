@@ -263,7 +263,7 @@ test "FIFO push/pop" {
     try std.testing.expectEqual(&a, q.pop(.keep_flag));
     try std.testing.expectEqual(&b, q.pop(.keep_flag));
     try std.testing.expectEqual(&c, q.pop(.keep_flag));
-    try std.testing.expectEqual(@as(?*Node, null), q.pop(.keep_flag));
+    try std.testing.expectEqual(null, q.pop(.keep_flag));
 }
 
 test "remove is position independent and idempotent" {
@@ -295,7 +295,7 @@ test "flag acquire/release fast paths" {
     try std.testing.expect(!q.tryClearFlag());
 
     try std.testing.expectEqual(&b, q.pop(.set_flag));
-    try std.testing.expectEqual(@as(?*Node, null), q.pop(.set_flag));
+    try std.testing.expectEqual(null, q.pop(.set_flag));
     try std.testing.expect(q.isFlagSet());
     try std.testing.expect(q.tryClearFlag());
 }

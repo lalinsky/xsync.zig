@@ -20,6 +20,8 @@ const Event = @This();
 queue: WaitQueue = .empty,
 
 pub const init: Event = .{};
+/// Alias matching `std.Io.Event`'s initial enum value.
+pub const unset: Event = .{};
 
 /// Returns whether the event is currently set.
 pub fn isSet(e: *const Event) bool {
@@ -50,9 +52,11 @@ pub fn waitUncancelable(e: *Event, io: Io) void {
     w.waitUncancelable();
 }
 
+pub const WaitTimeoutError = error{Timeout} || Cancelable;
+
 /// Blocks until the event is set or `timeout` elapses, returning
 /// `error.Timeout` on expiry.
-pub fn waitTimeout(e: *Event, io: Io, timeout: Io.Timeout) (error{Timeout} || Cancelable)!void {
+pub fn waitTimeout(e: *Event, io: Io, timeout: Io.Timeout) WaitTimeoutError!void {
     if (e.queue.isFlagSet()) return;
     if (timeout == .none) return e.wait(io);
 
@@ -123,7 +127,7 @@ test "set wakes all waiters" {
     e.set(io);
 
     try group.await(io);
-    try std.testing.expectEqual(@as(u32, 3), woken.load(.monotonic));
+    try std.testing.expectEqual(3, woken.load(.monotonic));
 }
 
 test "waitTimeout times out" {
