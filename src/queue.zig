@@ -3,13 +3,9 @@
 
 //! Bounded MPMC byte/element queue with the std.Io.Queue API and transfer
 //! logic, but a different synchronization layer: the queue state is guarded
-//! by an OS-level mutex (never parking a task), and each pending operation
-//! parks on its own futex word through its own `Io`, so producers and
-//! consumers can live on different `Io` instances.
-//!
-//! Wakes happen outside the mutex. A completed waiter is unlinked and chained
-//! onto a local wake list under the lock, and may not return until its futex
-//! word is set, so the deferred store cannot touch a dead frame.
+//! by an OS-level mutex, and each pending operation parks on its own futex
+//! word through its own `Io`, so producers and consumers can live on
+//! different `Io` instances.
 
 const std = @import("std");
 const Io = std.Io;
@@ -20,8 +16,6 @@ const assert = std.debug.assert;
 pub const QueueClosedError = error{Closed};
 
 pub const TypeErasedQueue = struct {
-    /// Locked via Threaded.mutexLock: blocks the calling thread, not the task.
-    /// Critical sections are short and never hold the lock across a park.
     mutex: Io.Mutex,
     closed: bool,
 
@@ -64,15 +58,15 @@ pub const TypeErasedQueue = struct {
         return @alignCast(@fieldParentPtr("waiter", waiterOf(node)));
     }
 
-    /// Moves a completed waiter from its wait list onto `wakes`. Its node is
-    /// safe to reuse: the waiter cannot return until the futex word is set.
+    /// Moves a completed waiter onto `wakes`. Reusing the node is fine: the
+    /// waiter cannot return until its futex word is set.
     fn chainWake(list: *std.DoublyLinkedList, wakes: *std.DoublyLinkedList, node: *std.DoublyLinkedList.Node) void {
         list.remove(node);
         waiterOf(node).queued = false;
         wakes.append(node);
     }
 
-    /// Delivers chained wakes. Must be called after releasing the mutex.
+    /// Delivers chained wakes; called after releasing the mutex.
     fn drainWakes(wakes: *std.DoublyLinkedList) void {
         while (wakes.popFirst()) |node| {
             const waiter = waiterOf(node);
@@ -83,8 +77,7 @@ pub const TypeErasedQueue = struct {
         }
     }
 
-    /// Blocks until an in-flight wake has stored the futex word, so the
-    /// pending frame can be safely destroyed. Called with the mutex held.
+    /// Waits out an in-flight wake before the pending frame goes away.
     fn awaitWake(q: *TypeErasedQueue, io: Io, futex: *std.atomic.Value(u32)) void {
         if (futex.load(.acquire) != 0) return;
         Threaded.mutexUnlock(&q.mutex);
@@ -162,7 +155,7 @@ pub const TypeErasedQueue = struct {
         return if (slice.len > 0) slice else null;
     }
 
-    fn putLocked(q: *TypeErasedQueue, io: Io, elements: []const u8, min: usize, uncancelable: bool, wakes: *std.DoublyLinkedList) (QueueClosedError || Cancelable)!usize {
+    fn putLocked(q: *TypeErasedQueue, io: Io, elements: []const u8, min: usize, comptime uncancelable: bool, wakes: *std.DoublyLinkedList) (QueueClosedError || Cancelable)!usize {
         // A closed queue cannot be added to, even if there is space in the buffer.
         if (q.closed) return error.Closed;
 
@@ -210,15 +203,13 @@ pub const TypeErasedQueue = struct {
 
         while (pending.needed > 0 and !q.closed) {
             Threaded.mutexUnlock(&q.mutex);
-            const result = if (uncancelable) blk: {
-                io.futexWaitUncancelable(u32, &pending.waiter.futex.raw, 0);
-                break :blk {};
-            } else io.futexWait(u32, &pending.waiter.futex.raw, 0);
+            const result: Cancelable!void = if (uncancelable)
+                io.futexWaitUncancelable(u32, &pending.waiter.futex.raw, 0)
+            else
+                io.futexWait(u32, &pending.waiter.futex.raw, 0);
             Threaded.mutexLock(&q.mutex);
             result catch |err| switch (err) {
                 error.Canceled => {
-                    // If we were completed or the queue closed, a wake is in
-                    // flight; it must land before this frame goes away.
                     if (!pending.waiter.queued) q.awaitWake(io, &pending.waiter.futex);
                     if (pending.remaining.len == elements.len) {
                         // Canceled while waiting, and appended no elements.
@@ -274,7 +265,7 @@ pub const TypeErasedQueue = struct {
         return if (slice.len > 0) slice else null;
     }
 
-    fn getLocked(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize, uncancelable: bool, wakes: *std.DoublyLinkedList) (QueueClosedError || Cancelable)!usize {
+    fn getLocked(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize, comptime uncancelable: bool, wakes: *std.DoublyLinkedList) (QueueClosedError || Cancelable)!usize {
         // The ring buffer gets first priority, then data should come from any
         // queued putters, then finally the ring buffer should be filled with
         // data from putters so they can be resumed.
@@ -335,15 +326,13 @@ pub const TypeErasedQueue = struct {
 
         while (pending.needed > 0 and !q.closed) {
             Threaded.mutexUnlock(&q.mutex);
-            const result = if (uncancelable) blk: {
-                io.futexWaitUncancelable(u32, &pending.waiter.futex.raw, 0);
-                break :blk {};
-            } else io.futexWait(u32, &pending.waiter.futex.raw, 0);
+            const result: Cancelable!void = if (uncancelable)
+                io.futexWaitUncancelable(u32, &pending.waiter.futex.raw, 0)
+            else
+                io.futexWait(u32, &pending.waiter.futex.raw, 0);
             Threaded.mutexLock(&q.mutex);
             result catch |err| switch (err) {
                 error.Canceled => {
-                    // If we were completed or the queue closed, a wake is in
-                    // flight; it must land before this frame goes away.
                     if (!pending.waiter.queued) q.awaitWake(io, &pending.waiter.futex);
                     if (pending.remaining.len == buffer.len) {
                         // Canceled while waiting, and received no elements.
