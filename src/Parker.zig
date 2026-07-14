@@ -4,7 +4,7 @@
 //! A futex word that tasks from multiple `Io` instances can park on. Tracks
 //! which ios currently have sleepers so a waker can reach each one through
 //! the right instance. Two inline slots cover the realistic case; further
-//! ios fall back to an intrusive list behind a spinlock.
+//! ios fall back to an intrusive list behind an OS mutex.
 
 const std = @import("std");
 const Io = std.Io;
@@ -13,7 +13,7 @@ const Parker = @This();
 
 word: std.atomic.Value(u32) = .init(0),
 slots: [2]Slot = .{ .{}, .{} },
-dir_lock: std.atomic.Value(bool) = .init(false),
+dir_lock: Io.Mutex = .init,
 overflow: std.atomic.Value(?*Node) = .init(null),
 
 /// Transient count marking a slot whose io is being written or cleared.
@@ -104,8 +104,8 @@ pub fn enter(p: *Parker, node: *Node) Ref {
         std.atomic.spinLoopHint();
     }
 
-    p.lockDir();
-    defer p.unlockDir();
+    Io.Threaded.mutexLock(&p.dir_lock);
+    defer Io.Threaded.mutexUnlock(&p.dir_lock);
     node.next = p.overflow.load(.monotonic);
     p.overflow.store(node, .release);
     return .{ .node = node };
@@ -115,8 +115,8 @@ pub fn leave(p: *Parker, ref: Ref) void {
     switch (ref) {
         .slot => |s| s.unpin(),
         .node => |n| {
-            p.lockDir();
-            defer p.unlockDir();
+            Io.Threaded.mutexLock(&p.dir_lock);
+            defer Io.Threaded.mutexUnlock(&p.dir_lock);
             var cur = p.overflow.load(.monotonic);
             if (cur == n) {
                 p.overflow.store(n.next, .monotonic);
@@ -140,23 +140,13 @@ pub fn wake(p: *Parker, max_waiters: u32) void {
         }
     }
     if (p.overflow.load(.seq_cst) != null) {
-        p.lockDir();
-        defer p.unlockDir();
+        Io.Threaded.mutexLock(&p.dir_lock);
+        defer Io.Threaded.mutexUnlock(&p.dir_lock);
         var cur = p.overflow.load(.monotonic);
         while (cur) |n| : (cur = n.next) {
             n.io.futexWake(u32, &p.word.raw, max_waiters);
         }
     }
-}
-
-fn lockDir(p: *Parker) void {
-    while (p.dir_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-        std.atomic.spinLoopHint();
-    }
-}
-
-fn unlockDir(p: *Parker) void {
-    p.dir_lock.store(false, .release);
 }
 
 fn ioEql(a: Io, b: Io) bool {
