@@ -2,60 +2,69 @@
 // SPDX-License-Identifier: MIT
 
 //! A mutual exclusion lock shareable between tasks on different `std.Io`
-//! instances. The lock is handed directly to the next FIFO waiter.
+//! instances. Same three-state futex design as `std.Io.Mutex`, parked on a
+//! `Parker` so the wake reaches the right io.
 
 const std = @import("std");
 
 const Io = std.Io;
 const Cancelable = Io.Cancelable;
-const WaitQueue = @import("WaitQueue.zig");
-const Node = WaitQueue.Node;
+const Parker = @import("Parker.zig");
 
 const Mutex = @This();
 
-/// Flag set means unlocked; flag clear means locked, with or without waiters.
-queue: WaitQueue = .flagged,
+parker: Parker = .{},
 
 pub const init: Mutex = .{};
 
-/// Acquires the lock without blocking, returning whether it succeeded.
+const unlocked: u32 = 0;
+const locked_once: u32 = 1;
+const contended: u32 = 2;
+
 pub fn tryLock(m: *Mutex) bool {
-    return m.queue.tryClearFlag();
+    return m.parker.word.cmpxchgStrong(unlocked, locked_once, .acquire, .monotonic) == null;
 }
 
-/// Acquires the lock, parking on `io` while another task holds it. On
-/// `error.Canceled` the lock is not held.
 pub fn lock(m: *Mutex, io: Io) Cancelable!void {
-    if (m.queue.tryClearFlag()) return;
+    if (m.tryLock()) {
+        @branchHint(.likely);
+        return;
+    }
 
-    var w: Node = .{ .io = io };
-    if (m.queue.push(&w, .acquire) == .acquired) return;
+    var node: Parker.Node = .{ .io = io };
+    const ref = m.parker.enter(&node);
+    defer m.parker.leave(ref);
 
-    w.wait() catch |err| {
-        // If we can't remove ourselves, unlock() already handed us the lock:
-        // take the wake and pass it on.
-        if (!m.queue.remove(&w)) {
-            w.waitUncancelable();
-            m.unlock(io);
-        }
-        return err;
-    };
+    while (m.parker.word.swap(contended, .acquire) != unlocked) {
+        try io.futexWait(u32, &m.parker.word.raw, contended);
+    }
 }
 
-/// Like `lock`, but ignores cancellation and always ends up holding the lock.
 pub fn lockUncancelable(m: *Mutex, io: Io) void {
-    if (m.queue.tryClearFlag()) return;
+    if (m.tryLock()) {
+        @branchHint(.likely);
+        return;
+    }
 
-    var w: Node = .{ .io = io };
-    if (m.queue.push(&w, .acquire) == .acquired) return;
+    var node: Parker.Node = .{ .io = io };
+    const ref = m.parker.enter(&node);
+    defer m.parker.leave(ref);
 
-    w.waitUncancelable();
+    while (m.parker.word.swap(contended, .acquire) != unlocked) {
+        io.futexWaitUncancelable(u32, &m.parker.word.raw, contended);
+    }
 }
 
-/// Releases the lock, handing it to the next waiter if there is one.
 pub fn unlock(m: *Mutex, io: Io) void {
     _ = io;
-    if (m.queue.pop(.set_flag)) |w| w.wake();
+    switch (m.parker.word.swap(unlocked, .seq_cst)) {
+        locked_once => {},
+        contended => {
+            @branchHint(.unlikely);
+            m.parker.wake(1);
+        },
+        else => unreachable,
+    }
 }
 
 test "uncontended lock/unlock" {

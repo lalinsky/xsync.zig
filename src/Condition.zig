@@ -2,90 +2,189 @@
 // SPDX-License-Identifier: MIT
 
 //! A condition variable shareable between tasks on different `std.Io`
-//! instances. Used with a `Mutex` guarding the predicate.
+//! instances. Used with a `Mutex` guarding the predicate. Same design as
+//! `std.Io.Condition` (with the cancelation fix from ziglang/zig#35564),
+//! parked on a `Parker` so wakes reach the right io.
 
 const std = @import("std");
+const assert = std.debug.assert;
+const math = std.math;
 
 const Io = std.Io;
 const Cancelable = Io.Cancelable;
-const WaitQueue = @import("WaitQueue.zig");
-const Node = WaitQueue.Node;
+const Parker = @import("Parker.zig");
 const Mutex = @import("Mutex.zig");
 
 const Condition = @This();
 
-queue: WaitQueue = .empty,
+state: std.atomic.Value(State) = .init(.{ .waiters = 0, .signals = 0 }),
+/// The epoch lives in parker.word; incremented whenever the condition is signaled.
+parker: Parker = .{},
+
+const State = packed struct(u32) {
+    waiters: u16,
+    signals: u16,
+};
 
 pub const init: Condition = .{};
 
-/// Atomically releases `mutex` and waits for a signal, reacquiring `mutex`
-/// before returning. The mutex is held again even on `error.Canceled`.
 pub fn wait(c: *Condition, io: Io, mutex: *Mutex) Cancelable!void {
-    var w: Node = .{ .io = io };
-    _ = c.queue.push(&w, .queue);
-    mutex.unlock(io);
-
-    w.wait() catch |err| {
-        // If a signal already claimed us, consume it and forward it on.
-        if (!c.queue.remove(&w)) {
-            w.waitUncancelable();
-            if (c.queue.pop(.keep_flag)) |n| n.wake();
-        }
-        mutex.lockUncancelable(io);
-        return err;
+    c.waitTimeout(io, mutex, .none) catch |err| switch (err) {
+        error.Timeout => unreachable,
+        error.Canceled => |e| return e,
     };
-
-    mutex.lockUncancelable(io);
 }
 
 pub const WaitTimeoutError = Cancelable || Io.Timeout.Error;
 
-/// Like `wait`, but returns `error.Timeout` if no signal arrives before
-/// `timeout` elapses. The mutex is held on every return path.
 pub fn waitTimeout(c: *Condition, io: Io, mutex: *Mutex, timeout: Io.Timeout) WaitTimeoutError!void {
-    if (timeout == .none) return c.wait(io, mutex);
-
-    var w: Node = .{ .io = io };
-    _ = c.queue.push(&w, .queue);
-    mutex.unlock(io);
-
     const deadline = timeout.toDeadline(io);
-    w.timedWait(deadline) catch |err| {
-        if (!c.queue.remove(&w)) {
-            w.waitUncancelable();
-            if (c.queue.pop(.keep_flag)) |n| n.wake();
-        }
-        mutex.lockUncancelable(io);
-        return err;
-    };
+    const epoch_word = &c.parker.word;
 
-    // If we can still remove ourselves the deadline won; else a signal did.
-    const timed_out = c.queue.remove(&w);
-    if (!timed_out) w.waitUncancelable();
+    var epoch = epoch_word.load(.acquire); // `.acquire` to ensure ordered before state load
 
-    mutex.lockUncancelable(io);
-    if (timed_out) return error.Timeout;
-}
+    {
+        const prev_state = c.state.fetchAdd(.{ .waiters = 1, .signals = 0 }, .monotonic);
+        assert(prev_state.waiters < math.maxInt(u16)); // overflow caused by too many waiters
+    }
 
-/// Like `wait`, but ignores cancellation.
-pub fn waitUncancelable(c: *Condition, io: Io, mutex: *Mutex) void {
-    var w: Node = .{ .io = io };
-    _ = c.queue.push(&w, .queue);
+    var node: Parker.Node = .{ .io = io };
+    const ref = c.parker.enter(&node);
+    defer c.parker.leave(ref);
+
     mutex.unlock(io);
-    w.waitUncancelable();
-    mutex.lockUncancelable(io);
+    defer mutex.lockUncancelable(io);
+
+    while (true) {
+        const result = io.futexWaitTimeout(u32, &epoch_word.raw, epoch, deadline);
+
+        epoch = epoch_word.load(.acquire); // `.acquire` to ensure ordered before `state` load
+
+        // We were woken normally, so try to consume a pending signal. A signal takes
+        // priority over an expired deadline, so this is checked before the deadline
+        // below. On error we safely remove ourselves as a waiter and propagate the error.
+        if (result) |_| {
+            var prev_state = c.state.load(.monotonic);
+            while (prev_state.signals > 0) {
+                prev_state = c.state.cmpxchgWeak(prev_state, .{
+                    .waiters = prev_state.waiters - 1,
+                    .signals = prev_state.signals - 1,
+                }, .acquire, .monotonic) orelse {
+                    // We successfully consumed a signal.
+                    return;
+                };
+            }
+        } else |err| {
+            c.deregister();
+            return err;
+        }
+
+        // There are no signals available and no error; if a timeout was specified and
+        // the deadline has passed, remove ourselves as a waiter and return
+        // `error.Timeout`. Otherwise, this was a spurious wakeup: loop back to the
+        // futex wait.
+        switch (deadline) {
+            .none => {},
+            .deadline => |d| if (d.untilNow(io).raw.nanoseconds >= 0) {
+                c.deregister();
+                return error.Timeout;
+            },
+            .duration => unreachable,
+        }
+    }
 }
 
-/// Wakes one waiter, if any.
+/// Same as `wait`, except does not introduce a cancelation point.
+pub fn waitUncancelable(c: *Condition, io: Io, mutex: *Mutex) void {
+    const epoch_word = &c.parker.word;
+
+    var epoch = epoch_word.load(.acquire);
+
+    {
+        const prev_state = c.state.fetchAdd(.{ .waiters = 1, .signals = 0 }, .monotonic);
+        assert(prev_state.waiters < math.maxInt(u16)); // overflow caused by too many waiters
+    }
+
+    var node: Parker.Node = .{ .io = io };
+    const ref = c.parker.enter(&node);
+    defer c.parker.leave(ref);
+
+    mutex.unlock(io);
+    defer mutex.lockUncancelable(io);
+
+    while (true) {
+        io.futexWaitUncancelable(u32, &epoch_word.raw, epoch);
+
+        epoch = epoch_word.load(.acquire);
+
+        var prev_state = c.state.load(.monotonic);
+        while (prev_state.signals > 0) {
+            prev_state = c.state.cmpxchgWeak(prev_state, .{
+                .waiters = prev_state.waiters - 1,
+                .signals = prev_state.signals - 1,
+            }, .acquire, .monotonic) orelse {
+                // We successfully consumed a signal.
+                return;
+            };
+        }
+
+        // No signals available; spurious wakeup, loop back to the futex wait.
+    }
+}
+
+fn deregister(c: *Condition) void {
+    var prev_state = c.state.load(.monotonic);
+    while (true) {
+        assert(prev_state.waiters > 0); // underflow caused by illegal state
+        const new_signals = @min(prev_state.signals, prev_state.waiters - 1);
+        prev_state = c.state.cmpxchgWeak(prev_state, .{
+            .waiters = prev_state.waiters - 1,
+            .signals = new_signals,
+        }, .acquire, .monotonic) orelse {
+            if (prev_state.signals > 0 and prev_state.signals < prev_state.waiters) {
+                // We kept a signal we are not consuming; wake a remaining waiter for it.
+                _ = c.parker.word.fetchAdd(1, .release);
+                c.parker.wake(1);
+            }
+            return;
+        };
+    }
+}
+
 pub fn signal(c: *Condition, io: Io) void {
     _ = io;
-    if (c.queue.pop(.keep_flag)) |w| w.wake();
+    var prev_state = c.state.load(.monotonic);
+    while (prev_state.waiters > prev_state.signals) {
+        @branchHint(.unlikely);
+        prev_state = c.state.cmpxchgWeak(prev_state, .{
+            .waiters = prev_state.waiters,
+            .signals = prev_state.signals + 1,
+        }, .release, .monotonic) orelse {
+            // Update the epoch to tell the waiting threads that there are new signals for them.
+            // Note that a waiting thread could miss a take if *exactly* (1<<32)-1 wakes happen
+            // between it observing the epoch and sleeping on it, but this is extraordinarily
+            // unlikely due to the precise number of calls required.
+            _ = c.parker.word.fetchAdd(1, .release); // `.release` to ensure ordered after `state` update
+            c.parker.wake(1);
+            return;
+        };
+    }
 }
 
-/// Wakes every current waiter.
 pub fn broadcast(c: *Condition, io: Io) void {
     _ = io;
-    while (c.queue.pop(.keep_flag)) |w| w.wake();
+    var prev_state = c.state.load(.monotonic);
+    while (prev_state.waiters > prev_state.signals) {
+        @branchHint(.unlikely);
+        prev_state = c.state.cmpxchgWeak(prev_state, .{
+            .waiters = prev_state.waiters,
+            .signals = prev_state.waiters,
+        }, .release, .monotonic) orelse {
+            _ = c.parker.word.fetchAdd(1, .release); // `.release` to ensure ordered after `state` update
+            c.parker.wake(prev_state.waiters - prev_state.signals);
+            return;
+        };
+    }
 }
 
 test "wait/signal" {
