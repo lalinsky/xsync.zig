@@ -27,9 +27,10 @@ const Slot = struct {
 
     /// Pin the slot so its io cannot be rewritten. Fails if it has no users.
     fn pin(s: *Slot) bool {
-        var c = s.count.load(.acquire);
+        var c = s.count.load(.seq_cst);
         while (c != 0 and c != claiming) {
-            c = s.count.cmpxchgWeak(c, c + 1, .seq_cst, .acquire) orelse return true;
+            std.debug.assert(c != claiming - 1); // pin count saturated
+            c = s.count.cmpxchgWeak(c, c + 1, .seq_cst, .seq_cst) orelse return true;
         }
         return false;
     }
@@ -65,10 +66,10 @@ const Slot = struct {
     fn tryClaim(s: *Slot, io: Io) bool {
         if (s.count.cmpxchgStrong(0, claiming, .acquire, .monotonic) != null) return false;
         s.io = io;
-        // Release is enough for the count-then-sleep ordering: futexWait
-        // re-checks the word under its own lock, which publishes this store
-        // before the waiter can actually park.
-        s.count.store(1, .release);
+        // Seq_cst pairs with wake()'s directory scan: a waker that misses this
+        // store must have written the word late enough for our futex check to
+        // see it.
+        s.count.store(1, .seq_cst);
         return true;
     }
 };
@@ -138,7 +139,7 @@ pub fn wake(p: *Parker, max_waiters: u32) void {
             io.futexWake(u32, &p.word.raw, max_waiters);
         }
     }
-    if (p.overflow.load(.acquire) != null) {
+    if (p.overflow.load(.seq_cst) != null) {
         p.lockDir();
         defer p.unlockDir();
         var cur = p.overflow.load(.monotonic);

@@ -143,7 +143,7 @@ fn deregister(c: *Condition) void {
         }, .acquire, .monotonic) orelse {
             if (prev_state.signals > 0 and prev_state.signals < prev_state.waiters) {
                 // We kept a signal we are not consuming; wake a remaining waiter for it.
-                _ = c.parker.word.fetchAdd(1, .release);
+                _ = c.parker.word.fetchAdd(1, .seq_cst);
                 c.parker.wake(1);
             }
             return;
@@ -164,7 +164,7 @@ pub fn signal(c: *Condition, io: Io) void {
             // Note that a waiting thread could miss a take if *exactly* (1<<32)-1 wakes happen
             // between it observing the epoch and sleeping on it, but this is extraordinarily
             // unlikely due to the precise number of calls required.
-            _ = c.parker.word.fetchAdd(1, .release); // `.release` to ensure ordered after `state` update
+            _ = c.parker.word.fetchAdd(1, .seq_cst); // ordered after `state`, and against wake()'s directory scan
             c.parker.wake(1);
             return;
         };
@@ -180,7 +180,7 @@ pub fn broadcast(c: *Condition, io: Io) void {
             .waiters = prev_state.waiters,
             .signals = prev_state.waiters,
         }, .release, .monotonic) orelse {
-            _ = c.parker.word.fetchAdd(1, .release); // `.release` to ensure ordered after `state` update
+            _ = c.parker.word.fetchAdd(1, .seq_cst); // ordered after `state`, and against wake()'s directory scan
             c.parker.wake(prev_state.waiters - prev_state.signals);
             return;
         };

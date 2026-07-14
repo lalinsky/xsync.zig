@@ -35,7 +35,7 @@ pub fn lock(m: *Mutex, io: Io) Cancelable!void {
     const ref = m.parker.enter(&node);
     defer m.parker.leave(ref);
 
-    while (m.parker.word.swap(contended, .acquire) != unlocked) {
+    while (m.parker.word.swap(contended, .acq_rel) != unlocked) {
         try io.futexWait(u32, &m.parker.word.raw, contended);
     }
 }
@@ -50,7 +50,7 @@ pub fn lockUncancelable(m: *Mutex, io: Io) void {
     const ref = m.parker.enter(&node);
     defer m.parker.leave(ref);
 
-    while (m.parker.word.swap(contended, .acquire) != unlocked) {
+    while (m.parker.word.swap(contended, .acq_rel) != unlocked) {
         io.futexWaitUncancelable(u32, &m.parker.word.raw, contended);
     }
 }
