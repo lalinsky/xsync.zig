@@ -117,12 +117,23 @@ pub const TypeErasedQueue = struct {
     }
 
     pub fn put(q: *TypeErasedQueue, io: Io, elements: []const u8, min: usize) (QueueClosedError || Cancelable)!usize {
+        return q.putTimeout(io, elements, min, .none) catch |err| switch (err) {
+            error.Timeout => unreachable,
+            else => |e| return e,
+        };
+    }
+
+    /// Same as `put`, except gives up when `timeout` expires. Returns
+    /// `error.Timeout` only if nothing was transferred; partial progress is
+    /// reported as a count.
+    pub fn putTimeout(q: *TypeErasedQueue, io: Io, elements: []const u8, min: usize, timeout: Io.Timeout) (QueueClosedError || Cancelable || Io.Timeout.Error)!usize {
         assert(elements.len >= min);
         if (elements.len == 0) return 0;
         try io.checkCancel();
+        const deadline = timeout.toDeadline(io);
         var wakes: std.DoublyLinkedList = .{};
         Threaded.mutexLock(&q.mutex);
-        const result = q.putLocked(io, elements, min, false, &wakes);
+        const result = q.putLocked(io, elements, min, false, deadline, &wakes);
         Threaded.mutexUnlock(&q.mutex);
         drainWakes(&wakes);
         return result;
@@ -136,11 +147,12 @@ pub const TypeErasedQueue = struct {
         if (elements.len == 0) return 0;
         var wakes: std.DoublyLinkedList = .{};
         Threaded.mutexLock(&q.mutex);
-        const result = q.putLocked(io, elements, min, true, &wakes);
+        const result = q.putLocked(io, elements, min, true, .none, &wakes);
         Threaded.mutexUnlock(&q.mutex);
         drainWakes(&wakes);
         return result catch |err| switch (err) {
             error.Canceled => unreachable,
+            error.Timeout => unreachable,
             error.Closed => |e| return e,
         };
     }
@@ -155,7 +167,7 @@ pub const TypeErasedQueue = struct {
         return if (slice.len > 0) slice else null;
     }
 
-    fn putLocked(q: *TypeErasedQueue, io: Io, elements: []const u8, min: usize, comptime uncancelable: bool, wakes: *std.DoublyLinkedList) (QueueClosedError || Cancelable)!usize {
+    fn putLocked(q: *TypeErasedQueue, io: Io, elements: []const u8, min: usize, comptime uncancelable: bool, deadline: Io.Timeout, wakes: *std.DoublyLinkedList) (QueueClosedError || Cancelable || Io.Timeout.Error)!usize {
         // A closed queue cannot be added to, even if there is space in the buffer.
         if (q.closed) return error.Closed;
 
@@ -206,7 +218,7 @@ pub const TypeErasedQueue = struct {
             const result: Cancelable!void = if (uncancelable)
                 io.futexWaitUncancelable(u32, &pending.waiter.futex.raw, 0)
             else
-                io.futexWait(u32, &pending.waiter.futex.raw, 0);
+                io.futexWaitTimeout(u32, &pending.waiter.futex.raw, 0, deadline);
             Threaded.mutexLock(&q.mutex);
             result catch |err| switch (err) {
                 error.Canceled => {
@@ -220,6 +232,15 @@ pub const TypeErasedQueue = struct {
                     return elements.len - pending.remaining.len;
                 },
             };
+            // Completion takes priority over an expired deadline.
+            if (!uncancelable) switch (deadline) {
+                .none => {},
+                .deadline => |d| if (pending.needed > 0 and !q.closed and d.untilNow(io).raw.nanoseconds >= 0) {
+                    if (pending.remaining.len == elements.len) return error.Timeout;
+                    return elements.len - pending.remaining.len;
+                },
+                .duration => unreachable,
+            };
         }
         if (!pending.waiter.queued) q.awaitWake(io, &pending.waiter.futex);
         if (pending.remaining.len == elements.len) {
@@ -231,12 +252,23 @@ pub const TypeErasedQueue = struct {
     }
 
     pub fn get(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize) (QueueClosedError || Cancelable)!usize {
+        return q.getTimeout(io, buffer, min, .none) catch |err| switch (err) {
+            error.Timeout => unreachable,
+            else => |e| return e,
+        };
+    }
+
+    /// Same as `get`, except gives up when `timeout` expires. Returns
+    /// `error.Timeout` only if nothing was transferred; partial progress is
+    /// reported as a count.
+    pub fn getTimeout(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize, timeout: Io.Timeout) (QueueClosedError || Cancelable || Io.Timeout.Error)!usize {
         assert(buffer.len >= min);
         if (buffer.len == 0) return 0;
         try io.checkCancel();
+        const deadline = timeout.toDeadline(io);
         var wakes: std.DoublyLinkedList = .{};
         Threaded.mutexLock(&q.mutex);
-        const result = q.getLocked(io, buffer, min, false, &wakes);
+        const result = q.getLocked(io, buffer, min, false, deadline, &wakes);
         Threaded.mutexUnlock(&q.mutex);
         drainWakes(&wakes);
         return result;
@@ -250,7 +282,7 @@ pub const TypeErasedQueue = struct {
         if (buffer.len == 0) return 0;
         var wakes: std.DoublyLinkedList = .{};
         Threaded.mutexLock(&q.mutex);
-        const result = q.getLocked(io, buffer, min, true, &wakes);
+        const result = q.getLocked(io, buffer, min, true, .none, &wakes);
         Threaded.mutexUnlock(&q.mutex);
         drainWakes(&wakes);
         return result catch |err| switch (err) {
@@ -265,7 +297,7 @@ pub const TypeErasedQueue = struct {
         return if (slice.len > 0) slice else null;
     }
 
-    fn getLocked(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize, comptime uncancelable: bool, wakes: *std.DoublyLinkedList) (QueueClosedError || Cancelable)!usize {
+    fn getLocked(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize, comptime uncancelable: bool, deadline: Io.Timeout, wakes: *std.DoublyLinkedList) (QueueClosedError || Cancelable || Io.Timeout.Error)!usize {
         // The ring buffer gets first priority, then data should come from any
         // queued putters, then finally the ring buffer should be filled with
         // data from putters so they can be resumed.
@@ -329,7 +361,7 @@ pub const TypeErasedQueue = struct {
             const result: Cancelable!void = if (uncancelable)
                 io.futexWaitUncancelable(u32, &pending.waiter.futex.raw, 0)
             else
-                io.futexWait(u32, &pending.waiter.futex.raw, 0);
+                io.futexWaitTimeout(u32, &pending.waiter.futex.raw, 0, deadline);
             Threaded.mutexLock(&q.mutex);
             result catch |err| switch (err) {
                 error.Canceled => {
@@ -342,6 +374,15 @@ pub const TypeErasedQueue = struct {
                     io.recancel();
                     return buffer.len - pending.remaining.len;
                 },
+            };
+            // Completion takes priority over an expired deadline.
+            if (!uncancelable) switch (deadline) {
+                .none => {},
+                .deadline => |d| if (pending.needed > 0 and !q.closed and d.untilNow(io).raw.nanoseconds >= 0) {
+                    if (pending.remaining.len == buffer.len) return error.Timeout;
+                    return buffer.len - pending.remaining.len;
+                },
+                .duration => unreachable,
             };
         }
         if (!pending.waiter.queued) q.awaitWake(io, &pending.waiter.futex);
@@ -436,6 +477,13 @@ pub fn Queue(Elem: type) type {
             }
         }
 
+        /// Same as `put`, except gives up when `timeout` expires. Returns
+        /// `error.Timeout` only if nothing was added; partial progress is
+        /// reported as a count.
+        pub fn putTimeout(q: *@This(), io: Io, elements: []const Elem, min: usize, timeout: Io.Timeout) (QueueClosedError || Cancelable || Io.Timeout.Error)!usize {
+            return @divExact(try q.type_erased.putTimeout(io, @ptrCast(elements), min * @sizeOf(Elem), timeout), @sizeOf(Elem));
+        }
+
         /// Same as `put`, except does not introduce a cancelation point.
         ///
         /// For a description of cancelation and cancelation points, see `Future.cancel`.
@@ -446,6 +494,11 @@ pub fn Queue(Elem: type) type {
         /// Appends `item` to the end of the queue, blocking if the queue is full.
         pub fn putOne(q: *@This(), io: Io, item: Elem) (QueueClosedError || Cancelable)!void {
             assert(try q.put(io, &.{item}, 1) == 1);
+        }
+
+        /// Same as `putOne`, except gives up when `timeout` expires.
+        pub fn putOneTimeout(q: *@This(), io: Io, item: Elem, timeout: Io.Timeout) (QueueClosedError || Cancelable || Io.Timeout.Error)!void {
+            assert(try q.putTimeout(io, &.{item}, 1, timeout) == 1);
         }
 
         /// Same as `putOne`, except does not introduce a cancelation point.
@@ -480,6 +533,13 @@ pub fn Queue(Elem: type) type {
             return @divExact(try q.type_erased.get(io, @ptrCast(buffer), min * @sizeOf(Elem)), @sizeOf(Elem));
         }
 
+        /// Same as `get`, except gives up when `timeout` expires. Returns
+        /// `error.Timeout` only if nothing was received; partial progress is
+        /// reported as a count.
+        pub fn getTimeout(q: *@This(), io: Io, buffer: []Elem, min: usize, timeout: Io.Timeout) (QueueClosedError || Cancelable || Io.Timeout.Error)!usize {
+            return @divExact(try q.type_erased.getTimeout(io, @ptrCast(buffer), min * @sizeOf(Elem), timeout), @sizeOf(Elem));
+        }
+
         /// Same as `get`, except does not introduce a cancelation point.
         ///
         /// For a description of cancelation and cancelation points, see `Future.cancel`.
@@ -491,6 +551,13 @@ pub fn Queue(Elem: type) type {
         pub fn getOne(q: *@This(), io: Io) (QueueClosedError || Cancelable)!Elem {
             var buf: [1]Elem = undefined;
             assert(try q.get(io, &buf, 1) == 1);
+            return buf[0];
+        }
+
+        /// Same as `getOne`, except gives up when `timeout` expires.
+        pub fn getOneTimeout(q: *@This(), io: Io, timeout: Io.Timeout) (QueueClosedError || Cancelable || Io.Timeout.Error)!Elem {
+            var buf: [1]Elem = undefined;
+            assert(try q.getTimeout(io, &buf, 1, timeout) == 1);
             return buf[0];
         }
 
@@ -579,4 +646,31 @@ test "batch put and min get" {
     // min=2: returns at least 2, up to whatever is buffered
     const got = try q.get(io, &out, 2);
     try std.testing.expect(got >= 2 and got <= 5);
+}
+
+test "getTimeout on empty queue times out" {
+    const io = std.testing.io;
+
+    var buf: [4]u64 = undefined;
+    var q: Queue(u64) = .init(&buf);
+
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } };
+    try std.testing.expectError(error.Timeout, q.getOneTimeout(io, timeout));
+
+    // still usable afterwards
+    try q.putOne(io, 9);
+    try std.testing.expectEqual(9, try q.getOneTimeout(io, timeout));
+}
+
+test "putTimeout on full queue times out" {
+    const io = std.testing.io;
+
+    var buf: [1]u64 = undefined;
+    var q: Queue(u64) = .init(&buf);
+
+    try q.putOne(io, 1);
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } };
+    try std.testing.expectError(error.Timeout, q.putOneTimeout(io, 2, timeout));
+
+    try std.testing.expectEqual(1, try q.getOne(io));
 }
