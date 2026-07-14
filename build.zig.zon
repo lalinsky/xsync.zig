@@ -8,5 +8,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "README.md",
+        "LICENSE",
     },
 }
