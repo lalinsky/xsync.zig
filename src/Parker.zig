@@ -16,22 +16,39 @@ slots: [2]Slot = .{ .{}, .{} },
 dir_lock: std.atomic.Value(bool) = .init(false),
 overflow: std.atomic.Value(?*Node) = .init(null),
 
+/// Transient count marking a slot whose io is being written or cleared.
+const claiming = std.math.maxInt(u32);
+
 const Slot = struct {
     count: std.atomic.Value(u32) = .init(0),
-    /// Stable while count > 0; written only under dir_lock while count == 0.
+    /// Stable while count is a pin count; written only by the holder that
+    /// moved count to `claiming`.
     io: ?Io = null,
 
     /// Pin the slot so its io cannot be rewritten. Fails if it has no users.
     fn pin(s: *Slot) bool {
         var c = s.count.load(.acquire);
-        while (c != 0) {
+        while (c != 0 and c != claiming) {
             c = s.count.cmpxchgWeak(c, c + 1, .seq_cst, .acquire) orelse return true;
         }
         return false;
     }
 
+    /// Drop a pin. The last one out clears the slot, returning the parker to
+    /// its init state (users may compare a quiesced primitive against .init).
     fn unpin(s: *Slot) void {
-        _ = s.count.fetchSub(1, .release);
+        var c = s.count.load(.monotonic);
+        while (true) {
+            if (c == 1) {
+                c = s.count.cmpxchgWeak(1, claiming, .acquire, .monotonic) orelse {
+                    s.io = null;
+                    s.count.store(0, .release);
+                    return;
+                };
+            } else {
+                c = s.count.cmpxchgWeak(c, c - 1, .release, .monotonic) orelse return;
+            }
+        }
     }
 
     /// Pin only if the slot belongs to `io`. The identity check runs while
@@ -42,6 +59,17 @@ const Slot = struct {
         if (ioEql(s.io.?, io)) return true;
         s.unpin();
         return false;
+    }
+
+    /// Take a free slot for `io`. Fails if the slot is not exactly free.
+    fn tryClaim(s: *Slot, io: Io) bool {
+        if (s.count.cmpxchgStrong(0, claiming, .acquire, .monotonic) != null) return false;
+        s.io = io;
+        // Release is enough for the count-then-sleep ordering: futexWait
+        // re-checks the word under its own lock, which publishes this store
+        // before the waiter can actually park.
+        s.count.store(1, .release);
+        return true;
     }
 };
 
@@ -58,23 +86,25 @@ pub const Ref = union(enum) {
 /// Registers `node.io` as having a sleeper on this word. Must be paired with
 /// `leave` after the wait returns.
 pub fn enter(p: *Parker, node: *Node) Ref {
-    for (&p.slots) |*s| {
-        if (s.tryPin(node.io)) return .{ .slot = s };
+    while (true) {
+        var settled = true;
+        for (&p.slots) |*s| {
+            switch (s.count.load(.acquire)) {
+                0 => if (s.tryClaim(node.io)) return .{ .slot = s } else {
+                    settled = false;
+                },
+                claiming => settled = false,
+                else => if (s.tryPin(node.io)) return .{ .slot = s },
+            }
+        }
+        // Both slots stably pinned by other ios: fall back to the overflow
+        // list. A transient state may free a slot, so retry those.
+        if (settled) break;
+        std.atomic.spinLoopHint();
     }
 
     p.lockDir();
     defer p.unlockDir();
-
-    for (&p.slots) |*s| {
-        if (s.tryPin(node.io)) return .{ .slot = s };
-    }
-    for (&p.slots) |*s| {
-        if (s.count.load(.monotonic) == 0) {
-            s.io = node.io;
-            s.count.store(1, .seq_cst);
-            return .{ .slot = s };
-        }
-    }
     node.next = p.overflow.load(.monotonic);
     p.overflow.store(node, .release);
     return .{ .node = node };
@@ -82,15 +112,7 @@ pub fn enter(p: *Parker, node: *Node) Ref {
 
 pub fn leave(p: *Parker, ref: Ref) void {
     switch (ref) {
-        .slot => |s| {
-            // Last one out clears the slot, returning the parker to its init
-            // state (users may compare a quiesced primitive against .init).
-            if (s.count.fetchSub(1, .release) == 1) {
-                p.lockDir();
-                defer p.unlockDir();
-                if (s.count.load(.monotonic) == 0) s.io = null;
-            }
-        },
+        .slot => |s| s.unpin(),
         .node => |n| {
             p.lockDir();
             defer p.unlockDir();
