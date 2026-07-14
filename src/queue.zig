@@ -215,6 +215,8 @@ pub const TypeErasedQueue = struct {
 
         while (pending.needed > 0 and !q.closed) {
             Threaded.mutexUnlock(&q.mutex);
+            // Wakes chained while servicing must go out before we park.
+            drainWakes(wakes);
             const result: Cancelable!void = if (uncancelable)
                 io.futexWaitUncancelable(u32, &pending.waiter.futex.raw, 0)
             else
@@ -287,6 +289,7 @@ pub const TypeErasedQueue = struct {
         drainWakes(&wakes);
         return result catch |err| switch (err) {
             error.Canceled => unreachable,
+            error.Timeout => unreachable,
             error.Closed => |e| return e,
         };
     }
@@ -358,6 +361,8 @@ pub const TypeErasedQueue = struct {
 
         while (pending.needed > 0 and !q.closed) {
             Threaded.mutexUnlock(&q.mutex);
+            // Wakes chained while servicing must go out before we park.
+            drainWakes(wakes);
             const result: Cancelable!void = if (uncancelable)
                 io.futexWaitUncancelable(u32, &pending.waiter.futex.raw, 0)
             else
@@ -673,4 +678,52 @@ test "putTimeout on full queue times out" {
     try std.testing.expectError(error.Timeout, q.putOneTimeout(io, 2, timeout));
 
     try std.testing.expectEqual(1, try q.getOne(io));
+}
+
+test "pending putter is woken before its servicer parks" {
+    const io = std.testing.io;
+
+    var buf: [1]u64 = undefined;
+    var q: Queue(u64) = .init(&buf);
+
+    const T = struct {
+        fn producer(w_io: Io, qq: *Queue(u64)) Cancelable!void {
+            qq.putAll(w_io, &.{ 1, 2 }) catch |err| switch (err) {
+                error.Closed => return,
+                error.Canceled => |e| return e,
+            };
+            qq.close(w_io);
+        }
+        fn consumer(w_io: Io, qq: *Queue(u64), got: *usize) Cancelable!void {
+            var out: [4]u64 = undefined;
+            got.* = qq.get(w_io, &out, 4) catch |err| switch (err) {
+                error.Closed => 0,
+                error.Canceled => |e| return e,
+            };
+        }
+    };
+
+    var got: usize = 0;
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    group.concurrent(io, T.producer, .{ io, &q }) catch return error.SkipZigTest;
+
+    // Wait until the producer is parked with a pending element, so the
+    // consumer both completes it and then pends itself.
+    while (true) {
+        Threaded.mutexLock(&q.type_erased.mutex);
+        const parked = q.type_erased.putters.first != null;
+        Threaded.mutexUnlock(&q.type_erased.mutex);
+        if (parked) break;
+        std.atomic.spinLoopHint();
+    }
+
+    group.concurrent(io, T.consumer, .{ io, &q, &got }) catch return error.SkipZigTest;
+    try group.await(io);
+
+    try std.testing.expectEqual(2, got);
+}
+
+test {
+    std.testing.refAllDecls(Queue(u64));
 }
