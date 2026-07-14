@@ -139,7 +139,32 @@ pub fn wake(p: *Parker, max_waiters: u32) void {
             io.futexWake(u32, &p.word.raw, max_waiters);
         }
     }
-    if (p.overflow.load(.seq_cst) != null) {
+    if (p.overflow.load(.seq_cst) == null) return;
+
+    // Copy the distinct ios out so futexWake runs outside the lock. One wake
+    // per io reaches every sleeper. More distinct ios than fit is not a real
+    // case; wake the rest under the lock if it ever happens.
+    var ios: [8]Io = undefined;
+    var len: usize = 0;
+    var rest = false;
+    {
+        Io.Threaded.mutexLock(&p.dir_lock);
+        defer Io.Threaded.mutexUnlock(&p.dir_lock);
+        var cur = p.overflow.load(.monotonic);
+        outer: while (cur) |n| : (cur = n.next) {
+            for (ios[0..len]) |io| {
+                if (ioEql(io, n.io)) continue :outer;
+            }
+            if (len == ios.len) {
+                rest = true;
+                break;
+            }
+            ios[len] = n.io;
+            len += 1;
+        }
+    }
+    for (ios[0..len]) |io| io.futexWake(u32, &p.word.raw, max_waiters);
+    if (rest) {
         Io.Threaded.mutexLock(&p.dir_lock);
         defer Io.Threaded.mutexUnlock(&p.dir_lock);
         var cur = p.overflow.load(.monotonic);

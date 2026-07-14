@@ -167,3 +167,37 @@ test "waitTimeout times out" {
     const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } };
     try std.testing.expectError(error.Timeout, e.waitTimeout(io, timeout));
 }
+
+test "three ios: overflow directory path" {
+    const gpa = std.testing.allocator;
+
+    var t1: Io.Threaded = .init(gpa, .{});
+    defer t1.deinit();
+    var t2: Io.Threaded = .init(gpa, .{});
+    defer t2.deinit();
+    var t3: Io.Threaded = .init(gpa, .{});
+    defer t3.deinit();
+    const ios: [3]Io = .{ t1.io(), t2.io(), t3.io() };
+
+    var e: Event = .init;
+    var woken: std.atomic.Value(u32) = .init(0);
+
+    const T = struct {
+        fn waiter(w_io: Io, ev: *Event, count: *std.atomic.Value(u32)) Cancelable!void {
+            try ev.wait(w_io);
+            _ = count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var groups: [3]Io.Group = .{ .init, .init, .init };
+    for (&groups, ios) |*g, io| {
+        g.concurrent(io, T.waiter, .{ io, &e, &woken }) catch return error.SkipZigTest;
+    }
+
+    // Both slots take one io each; wait until the third lands in overflow.
+    while (e.parker.overflow.load(.acquire) == null) std.atomic.spinLoopHint();
+    e.set(ios[0]);
+
+    for (&groups, ios) |*g, io| try g.await(io);
+    try std.testing.expectEqual(3, woken.load(.monotonic));
+}
