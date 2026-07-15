@@ -66,7 +66,14 @@ pub fn lock(rl: *RwLock, io: Io) Io.Cancelable!void {
     if (state & reader_mask != 0)
         rl.semaphore.wait(io) catch |err| switch (err) {
             error.Canceled => {
-                rl.unlock(io);
+                // Deviation from upstream: the final reader may post right as
+                // the wait is canceled. Clear is_writing first; if the readers
+                // are already gone, that post is guaranteed and has to be
+                // consumed here, or a later writer would take it while
+                // readers are active.
+                const prev = @atomicRmw(usize, &rl.state, .And, ~is_writing, .seq_cst);
+                if (prev & reader_mask == 0) rl.semaphore.waitUncancelable(io);
+                rl.mutex.unlock(io);
                 return error.Canceled;
             },
         };
@@ -322,4 +329,53 @@ fn mutexLockCancel(rl: *RwLock, io: Io) !void {
     io.recancel();
     try std.testing.expectEqual(error.Canceled, rl.lock(io));
     return error.Canceled;
+}
+
+test "canceled writer must not leave a semaphore permit" {
+    const io = testing.io;
+
+    var rl: RwLock = .init;
+
+    const T = struct {
+        fn writer(w_io: Io, l: *RwLock) Io.Cancelable!void {
+            l.lock(w_io) catch return;
+            l.unlock(w_io);
+        }
+        fn cancelWriter(c_io: Io, f: *Io.Future(Io.Cancelable!void)) Io.Cancelable!void {
+            f.cancel(c_io) catch {};
+        }
+    };
+
+    for (0..100) |i| {
+        try rl.lockShared(io);
+
+        var fut = io.concurrent(T.writer, .{ io, &rl }) catch {
+            rl.unlockShared(io);
+            return error.SkipZigTest;
+        };
+
+        while (@atomicLoad(usize, &rl.state, .seq_cst) & is_writing == 0) {
+            std.atomic.spinLoopHint();
+        }
+
+        // Cancel from a second task so the cancellation and the final
+        // reader's post genuinely race.
+        var canceler = io.concurrent(T.cancelWriter, .{ io, &fut }) catch {
+            rl.unlockShared(io);
+            fut.cancel(io) catch {};
+            return error.SkipZigTest;
+        };
+        _ = i;
+        rl.unlockShared(io);
+        canceler.await(io) catch {};
+
+        // No permit may survive the round.
+        rl.semaphore.mutex.lockUncancelable(io);
+        const leftover = rl.semaphore.permits;
+        rl.semaphore.mutex.unlock(io);
+        try testing.expectEqual(0, leftover);
+
+        try testing.expect(rl.tryLock(io));
+        rl.unlock(io);
+    }
 }
