@@ -99,6 +99,11 @@ exe.root_module.addImport("xsync", xsync);
 
 Tested on Zig 0.16 and master.
 
+## Zig bug reports
+
+- [36139](https://codeberg.org/ziglang/zig/issues/36139) - Cancellation safety in std.Io.Conditon
+- [36178](https://codeberg.org/ziglang/zig/issues/36178) - Io.RwLock: canceled writer can leave a stale semaphore permit 
+
 ## License
 
 MIT, same as Zig. Semaphore, RwLock and the queue's transfer logic come from
