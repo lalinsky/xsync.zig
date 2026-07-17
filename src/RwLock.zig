@@ -32,10 +32,20 @@ const Count = @Int(.unsigned, @divFloor(@bitSizeOf(usize) - 1, 2));
 
 pub fn tryLock(rl: *RwLock, io: Io) bool {
     if (rl.mutex.tryLock()) {
-        const state = @atomicLoad(usize, &rl.state, .seq_cst);
-        if (state & reader_mask == 0) {
-            _ = @atomicRmw(usize, &rl.state, .Or, is_writing, .seq_cst);
-            return true;
+        // Deviation from upstream: holding the mutex does not block the
+        // reader fast path, so the reader check and the is_writing claim
+        // must be one atomic step; a blind .Or after the check would race
+        // with a reader's CAS and admit both.
+        var state = @atomicLoad(usize, &rl.state, .seq_cst);
+        while (state & reader_mask == 0) {
+            state = @cmpxchgWeak(
+                usize,
+                &rl.state,
+                state,
+                state | is_writing,
+                .seq_cst,
+                .seq_cst,
+            ) orelse return true;
         }
 
         rl.mutex.unlock(io);
@@ -329,6 +339,76 @@ fn mutexLockCancel(rl: *RwLock, io: Io) !void {
     io.recancel();
     try std.testing.expectEqual(error.Canceled, rl.lock(io));
     return error.Canceled;
+}
+
+test "tryLock excludes fast-path readers" {
+    if (builtin.single_threaded) return;
+
+    const io = testing.io;
+    const writer_attempts = 1_000_000;
+    const num_readers = 3;
+
+    // readers_inside is nonzero only while a reader holds the lock, and
+    // writer_inside is true only while the writer holds it, so either side
+    // observing the other proves a mutual exclusion violation.
+    const Ctx = struct {
+        io: Io,
+        rl: RwLock = .init,
+        readers_inside: std.atomic.Value(u32) = .init(0),
+        writer_inside: std.atomic.Value(bool) = .init(false),
+        violations: std.atomic.Value(u32) = .init(0),
+        stop: std.atomic.Value(bool) = .init(false),
+
+        fn writer(ctx: *@This()) void {
+            var i: usize = 0;
+            while (i < writer_attempts and !ctx.stop.load(.monotonic)) : (i += 1) {
+                if (ctx.rl.tryLock(ctx.io)) {
+                    ctx.writer_inside.store(true, .seq_cst);
+                    if (ctx.readers_inside.load(.seq_cst) != 0) {
+                        _ = ctx.violations.fetchAdd(1, .seq_cst);
+                        ctx.stop.store(true, .monotonic);
+                    }
+                    for (0..20) |_| std.atomic.spinLoopHint();
+                    ctx.writer_inside.store(false, .seq_cst);
+                    ctx.rl.unlock(ctx.io);
+                }
+            }
+            ctx.stop.store(true, .monotonic);
+        }
+
+        fn reader(ctx: *@This()) void {
+            while (!ctx.stop.load(.monotonic)) {
+                if (ctx.rl.tryLockShared(ctx.io)) {
+                    _ = ctx.readers_inside.fetchAdd(1, .seq_cst);
+                    if (ctx.writer_inside.load(.seq_cst)) {
+                        _ = ctx.violations.fetchAdd(1, .seq_cst);
+                        ctx.stop.store(true, .monotonic);
+                    }
+                    for (0..20) |_| std.atomic.spinLoopHint();
+                    _ = ctx.readers_inside.fetchSub(1, .seq_cst);
+                    ctx.rl.unlockShared(ctx.io);
+                }
+            }
+        }
+    };
+
+    var ctx: Ctx = .{ .io = io };
+
+    var writer_thread = try std.Thread.spawn(.{}, Ctx.writer, .{&ctx});
+    var reader_threads: [num_readers]std.Thread = undefined;
+    for (&reader_threads) |*t| t.* = try std.Thread.spawn(.{}, Ctx.reader, .{&ctx});
+
+    writer_thread.join();
+    for (reader_threads) |t| t.join();
+
+    try testing.expectEqual(0, ctx.violations.load(.seq_cst));
+
+    // The race also leaks a semaphore permit: the raced reader's
+    // unlockShared posts for a writer that never waits.
+    ctx.rl.semaphore.mutex.lockUncancelable(io);
+    const leftover = ctx.rl.semaphore.permits;
+    ctx.rl.semaphore.mutex.unlock(io);
+    try testing.expectEqual(0, leftover);
 }
 
 test "canceled writer must not leave a semaphore permit" {
