@@ -65,20 +65,28 @@ pub fn waitUncancelable(e: *Event, io: Io) void {
 
 pub const WaitTimeoutError = error{Timeout} || Cancelable;
 
-/// Blocks until the event is set, the timeout expires, or a spurious wakeup
-/// occurs. Returns `error.Timeout` for the latter two.
+/// Blocks until the event is set or the timeout expires. Returns
+/// `error.Timeout` for the latter; spurious wakeups resume the wait.
 pub fn waitTimeout(e: *Event, io: Io, timeout: Io.Timeout) WaitTimeoutError!void {
+    const deadline = timeout.toDeadline(io);
     if (!e.beginWait()) return;
 
     var node: Parker.Node = .{ .io = io };
     const ref = e.parker.enter(&node);
     defer e.parker.leave(ref);
 
-    try io.futexWaitTimeout(u32, &e.parker.word.raw, @intFromEnum(State.waiting), timeout);
-    switch (e.load()) {
-        .unset => unreachable, // reset called before pending wait returned
-        .waiting => return error.Timeout,
-        .is_set => return,
+    while (true) {
+        try io.futexWaitTimeout(u32, &e.parker.word.raw, @intFromEnum(State.waiting), deadline);
+        switch (e.load()) {
+            .unset => unreachable, // reset called before pending wait returned
+            .waiting => {},
+            .is_set => return,
+        }
+        switch (deadline) {
+            .none => {},
+            .deadline => |d| if (d.untilNow(io).raw.nanoseconds >= 0) return error.Timeout,
+            .duration => unreachable,
+        }
     }
 }
 
@@ -166,6 +174,38 @@ test "waitTimeout times out" {
 
     const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } };
     try std.testing.expectError(error.Timeout, e.waitTimeout(io, timeout));
+}
+
+test "spurious wakeup does not time out early" {
+    const io = std.testing.io;
+
+    var e: Event = .init;
+    var timed_out: std.atomic.Value(bool) = .init(false);
+
+    const T = struct {
+        fn waiter(w_io: Io, ev: *Event, flag: *std.atomic.Value(bool)) Cancelable!void {
+            const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } };
+            ev.waitTimeout(w_io, timeout) catch |err| switch (err) {
+                error.Timeout => flag.store(true, .monotonic),
+                error.Canceled => |c| return c,
+            };
+        }
+    };
+
+    var group: Io.Group = .init;
+    group.concurrent(io, T.waiter, .{ io, &e, &timed_out }) catch return error.SkipZigTest;
+
+    // Pepper the parked waiter with wakes that don't set the event; it must
+    // re-park rather than report Timeout long before the deadline.
+    while (e.parker.word.load(.acquire) != @intFromEnum(State.waiting)) std.atomic.spinLoopHint();
+    for (0..1000) |_| {
+        e.parker.wake(std.math.maxInt(u32));
+        std.atomic.spinLoopHint();
+    }
+    e.set(io);
+
+    try group.await(io);
+    try std.testing.expect(!timed_out.load(.monotonic));
 }
 
 test "three ios: overflow directory path" {
