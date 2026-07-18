@@ -94,8 +94,12 @@ exe.root_module.addImport("xsync", xsync);
 - Unlike the extern `std.Io.Mutex`, these can't live in shared memory or work
   across processes.
 - No FIFO ordering guarantees, same as `std.Io`.
-- Any thread-safe `Io` implementation works; the only requirement is that its
-  `futexWake` may be called from another thread.
+- Any thread-safe `Io` implementation works; its `futexWake` must be callable
+  from another thread and must not dereference the word.
+- Don't free a primitive until every call on it has returned, including
+  `unlock`/`set`/`signal`/`post`.
+- Don't deinit an `Io` while other tasks may still be waking primitives that
+  its tasks parked on.
 
 Tested on Zig 0.16 and master.
 
