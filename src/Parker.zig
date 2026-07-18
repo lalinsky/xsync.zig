@@ -107,7 +107,10 @@ pub fn enter(p: *Parker, node: *Node) Ref {
     Io.Threaded.mutexLock(&p.dir_lock);
     defer Io.Threaded.mutexUnlock(&p.dir_lock);
     node.next = p.overflow.load(.monotonic);
-    p.overflow.store(node, .release);
+    // Seq_cst for the same reason as tryClaim's count store: a waker whose
+    // null check misses this node must have written the word late enough
+    // for our futex check to see it.
+    p.overflow.store(node, .seq_cst);
     return .{ .node = node };
 }
 
