@@ -21,4 +21,5 @@ test {
     _ = Semaphore;
     _ = RwLock;
     _ = Queue;
+    _ = @import("TestIo.zig");
 }
