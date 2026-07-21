@@ -105,6 +105,45 @@ test "concurrent counter" {
     try std.testing.expectEqual(4000, counter);
 }
 
+test "canceled waiter does not consume the wake" {
+    const io = std.testing.io;
+
+    var m: Mutex = .init;
+
+    const T = struct {
+        fn locker(w_io: Io, mtx: *Mutex) Cancelable!void {
+            try mtx.lock(w_io);
+            mtx.unlock(w_io);
+        }
+    };
+
+    for (0..50) |_| {
+        try m.lock(io);
+
+        var a = io.concurrent(T.locker, .{ io, &m }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                m.unlock(io);
+                return error.SkipZigTest;
+            },
+        };
+        var b = io.concurrent(T.locker, .{ io, &m }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                m.unlock(io);
+                _ = a.cancel(io) catch {};
+                return error.SkipZigTest;
+            },
+        };
+
+        // At least one waiter has parked; the main task holds the lock, so
+        // neither can acquire and the cancel outcome is deterministic.
+        while (m.parker.word.load(.acquire) != contended) std.atomic.spinLoopHint();
+
+        try std.testing.expectEqual(error.Canceled, a.cancel(io));
+        m.unlock(io);
+        try b.await(io);
+    }
+}
+
 test "three ios: concurrent counter" {
     const gpa = std.testing.allocator;
 

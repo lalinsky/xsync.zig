@@ -208,6 +208,42 @@ test "spurious wakeup does not time out early" {
     try std.testing.expect(!timed_out.load(.monotonic));
 }
 
+test "canceled waiter does not block set for others" {
+    const io = std.testing.io;
+
+    var e: Event = .init;
+    var woken: std.atomic.Value(u32) = .init(0);
+
+    const T = struct {
+        fn waiter(w_io: Io, ev: *Event, count: *std.atomic.Value(u32)) Cancelable!void {
+            try ev.wait(w_io);
+            _ = count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var victim = io.concurrent(T.waiter, .{ io, &e, &woken }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+    var group: Io.Group = .init;
+    for (0..2) |_| {
+        group.concurrent(io, T.waiter, .{ io, &e, &woken }) catch {
+            _ = victim.cancel(io) catch {};
+            group.cancel(io);
+            return error.SkipZigTest;
+        };
+    }
+
+    while (e.parker.word.load(.acquire) != @intFromEnum(State.waiting)) std.atomic.spinLoopHint();
+
+    // The event is never set before the cancel, so the victim cannot
+    // complete normally.
+    try std.testing.expectEqual(error.Canceled, victim.cancel(io));
+    e.set(io);
+
+    try group.await(io);
+    try std.testing.expectEqual(2, woken.load(.monotonic));
+}
+
 test "three ios: overflow directory path" {
     const gpa = std.testing.allocator;
 

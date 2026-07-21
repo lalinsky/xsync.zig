@@ -680,6 +680,157 @@ test "putTimeout on full queue times out" {
     try std.testing.expectEqual(1, try q.getOne(io));
 }
 
+fn waitParked(q: *TypeErasedQueue, list: enum { getters, putters }) void {
+    while (true) {
+        Threaded.mutexLock(&q.mutex);
+        const parked = switch (list) {
+            .getters => q.getters.first != null,
+            .putters => q.putters.first != null,
+        };
+        Threaded.mutexUnlock(&q.mutex);
+        if (parked) return;
+        std.atomic.spinLoopHint();
+    }
+}
+
+test "cancel parked getter and putter" {
+    const io = std.testing.io;
+
+    var buf: [1]u64 = undefined;
+    var q: Queue(u64) = .init(&buf);
+
+    const T = struct {
+        fn getter(w_io: Io, qq: *Queue(u64)) Cancelable!void {
+            _ = qq.getOne(w_io) catch |err| switch (err) {
+                error.Closed => return,
+                error.Canceled => |e| return e,
+            };
+        }
+        fn putter(w_io: Io, qq: *Queue(u64)) Cancelable!void {
+            qq.putOne(w_io, 99) catch |err| switch (err) {
+                error.Closed => return,
+                error.Canceled => |e| return e,
+            };
+        }
+    };
+
+    var gfut = io.concurrent(T.getter, .{ io, &q }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+    waitParked(&q.type_erased, .getters);
+    try std.testing.expectEqual(error.Canceled, gfut.cancel(io));
+
+    // Queue unaffected: fill it, then cancel a parked putter.
+    try q.putOne(io, 1);
+    var pfut = io.concurrent(T.putter, .{ io, &q }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+    waitParked(&q.type_erased, .putters);
+    try std.testing.expectEqual(error.Canceled, pfut.cancel(io));
+
+    try std.testing.expectEqual(1, try q.getOne(io));
+    var out: [1]u64 = undefined;
+    try std.testing.expectEqual(0, try q.get(io, &out, 0));
+}
+
+test "cancel racing completion delivers exactly once" {
+    const io = std.testing.io;
+
+    var buf: [1]u64 = undefined;
+    var q: Queue(u64) = .init(&buf);
+
+    const T = struct {
+        fn getter(w_io: Io, qq: *Queue(u64), out: *std.atomic.Value(u64)) Cancelable!void {
+            const v = qq.getOne(w_io) catch |err| switch (err) {
+                error.Closed => return,
+                error.Canceled => |e| return e,
+            };
+            out.store(v, .seq_cst);
+        }
+        fn canceler(c_io: Io, f: *Io.Future(Cancelable!void)) Cancelable!void {
+            f.cancel(c_io) catch {};
+        }
+    };
+
+    for (0..100) |round| {
+        const elem: u64 = round + 1;
+        var got: std.atomic.Value(u64) = .init(0);
+
+        var fut = io.concurrent(T.getter, .{ io, &q, &got }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return error.SkipZigTest,
+        };
+        waitParked(&q.type_erased, .getters);
+
+        // Cancel from a second task so it genuinely races the completion.
+        var canceler = io.concurrent(T.canceler, .{ io, &fut }) catch {
+            _ = fut.cancel(io) catch {};
+            return error.SkipZigTest;
+        };
+        try q.putOne(io, elem);
+        canceler.await(io) catch {};
+
+        // Exactly once: the getter either received the element, or it was
+        // canceled first and the element stayed buffered.
+        var out: [1]u64 = undefined;
+        const leftover = try q.get(io, &out, 0);
+        if (got.load(.seq_cst) != 0) {
+            try std.testing.expectEqual(elem, got.load(.seq_cst));
+            try std.testing.expectEqual(0, leftover);
+        } else {
+            try std.testing.expectEqual(1, leftover);
+            try std.testing.expectEqual(elem, out[0]);
+        }
+    }
+}
+
+test "cancel after partial put returns count then Canceled" {
+    const io = std.testing.io;
+
+    var buf: [4]u64 = undefined;
+    var q: Queue(u64) = .init(&buf);
+
+    const T = struct {
+        fn producer(w_io: Io, qq: *Queue(u64), n_out: *usize, second_canceled: *bool) Cancelable!void {
+            const vals: [8]u64 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+            const n = qq.put(w_io, &vals, 8) catch |err| switch (err) {
+                error.Closed => unreachable,
+                error.Canceled => |e| return e,
+            };
+            n_out.* = n;
+            // recancel: the next cancelable call must observe the cancellation
+            _ = qq.put(w_io, &vals, 8) catch |err| switch (err) {
+                error.Closed => unreachable,
+                error.Canceled => {
+                    second_canceled.* = true;
+                    return error.Canceled;
+                },
+            };
+        }
+    };
+
+    var n_out: usize = 0;
+    var second_canceled = false;
+    var fut = io.concurrent(T.producer, .{ io, &q, &n_out, &second_canceled }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+    waitParked(&q.type_erased, .putters);
+
+    // Take two elements; servicing refills the ring from the parked putter,
+    // leaving it with partial progress (6 of 8 transferred, still parked).
+    var out2: [2]u64 = undefined;
+    try std.testing.expectEqual(2, try q.get(io, &out2, 2));
+    try std.testing.expectEqual(1, out2[0]);
+    try std.testing.expectEqual(2, out2[1]);
+
+    try std.testing.expectEqual(error.Canceled, fut.cancel(io));
+    try std.testing.expectEqual(6, n_out);
+    try std.testing.expect(second_canceled);
+
+    for (0..4) |i| try std.testing.expectEqual(i + 3, try q.getOne(io));
+    var out: [1]u64 = undefined;
+    try std.testing.expectEqual(0, try q.get(io, &out, 0));
+}
+
 test "two ios: producer/consumer" {
     const gpa = std.testing.allocator;
 

@@ -297,6 +297,50 @@ test "three ios: broadcast reaches every io" {
     try std.testing.expectEqual(3, woken.load(.monotonic));
 }
 
+test "canceled waiter passes its signal on" {
+    const io = std.testing.io;
+
+    const T = struct {
+        fn waiter(w_io: Io, mtx: *Mutex, cnd: *Condition, flag: *bool, arr: *std.atomic.Value(u32)) Cancelable!void {
+            try mtx.lock(w_io);
+            defer mtx.unlock(w_io);
+            _ = arr.fetchAdd(1, .monotonic);
+            while (!flag.*) try cnd.wait(w_io, mtx);
+        }
+    };
+
+    for (0..100) |_| {
+        var m: Mutex = .init;
+        var cond: Condition = .init;
+        var ready = false;
+        var arrived: std.atomic.Value(u32) = .init(0);
+
+        var w1 = io.concurrent(T.waiter, .{ io, &m, &cond, &ready, &arrived }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return error.SkipZigTest,
+        };
+        var w2 = io.concurrent(T.waiter, .{ io, &m, &cond, &ready, &arrived }) catch {
+            _ = w1.cancel(io) catch {};
+            return error.SkipZigTest;
+        };
+
+        while (arrived.load(.monotonic) < 2) std.atomic.spinLoopHint();
+        m.lockUncancelable(io);
+        ready = true;
+        m.unlock(io);
+        cond.signal(io);
+
+        // Cancel races the signal delivery. If w1 was canceled before it
+        // could consume the signal, deregister must pass it to w2; if w1
+        // consumed it and completed, w2 legitimately needs a fresh signal.
+        if (w1.cancel(io)) |_| {
+            cond.signal(io);
+        } else |err| switch (err) {
+            error.Canceled => {},
+        }
+        try w2.await(io);
+    }
+}
+
 test "waitTimeout times out" {
     const io = std.testing.io;
 
