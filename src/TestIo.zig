@@ -17,6 +17,9 @@ vtable: Io.VTable,
 table_lock: Io.Mutex = .init,
 proxies: [32]Proxy = @splat(.{}),
 
+/// Entries are claimed permanently; the pool must cover every distinct word
+/// address a test parks on (queue waiters park on stack words, so heavy
+/// queue tests cost one entry per task stack). Exhaustion panics loudly.
 const Proxy = struct {
     addr: usize = 0,
     seq: std.atomic.Value(u32) = .init(0),
@@ -105,12 +108,14 @@ test "wakes do not cross instances" {
     defer b.deinit();
 
     var word: std.atomic.Value(u32) = .init(0);
+    var wakeups: std.atomic.Value(u32) = .init(0);
     var done: std.atomic.Value(bool) = .init(false);
 
     const T = struct {
-        fn waiter(w_io: Io, w: *std.atomic.Value(u32), d: *std.atomic.Value(bool)) Cancelable!void {
+        fn waiter(w_io: Io, w: *std.atomic.Value(u32), wk: *std.atomic.Value(u32), d: *std.atomic.Value(bool)) Cancelable!void {
             while (w.load(.acquire) == 0) {
                 try w_io.futexWait(u32, &w.raw, 0);
+                _ = wk.fetchAdd(1, .monotonic);
             }
             d.store(true, .release);
         }
@@ -118,13 +123,16 @@ test "wakes do not cross instances" {
 
     var group: Io.Group = .init;
     defer group.cancel(a.io());
-    group.concurrent(a.io(), T.waiter, .{ a.io(), &word, &done }) catch return error.SkipZigTest;
+    group.concurrent(a.io(), T.waiter, .{ a.io(), &word, &wakeups, &done }) catch return error.SkipZigTest;
 
     // Give the waiter a moment to park, then wake through the wrong io: the
-    // waiter must stay asleep.
+    // waiter must stay asleep. The wakeup counter catches a leak even though
+    // the waiter would re-park (a kernel spurious wake on the proxy could
+    // trip this in theory; that is far rarer than the bugs it catches).
     for (0..100_000) |_| std.atomic.spinLoopHint();
     b.io().futexWake(u32, &word.raw, std.math.maxInt(u32));
     for (0..100_000) |_| std.atomic.spinLoopHint();
+    try std.testing.expectEqual(0, wakeups.load(.monotonic));
     try std.testing.expect(!done.load(.acquire));
 
     // The right io still delivers.

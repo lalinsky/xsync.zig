@@ -244,6 +244,9 @@ test "canceled waiter does not block set for others" {
     try std.testing.expectEqual(2, woken.load(.monotonic));
 }
 
+// Covers the overflow list mechanics, not wake routing: Threaded ios share
+// the kernel futex namespace, so any io's wake reaches every waiter. Routing
+// is covered by the TestIo variants.
 test "three ios: overflow directory path" {
     const gpa = std.testing.allocator;
 
