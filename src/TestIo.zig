@@ -92,6 +92,7 @@ fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
 
 const Event = @import("Event.zig");
 const Mutex = @import("Mutex.zig");
+const Condition = @import("Condition.zig");
 const Queue = @import("queue.zig").Queue;
 const Cancelable = Io.Cancelable;
 
@@ -168,6 +169,75 @@ test "event across incompatible ios" {
     try ga.await(a.io());
     try gb.await(b.io());
     try std.testing.expectEqual(2, woken.load(.monotonic));
+}
+
+test "event overflow across three incompatible ios" {
+    const gpa = std.testing.allocator;
+
+    var mocks: [3]TestIo = .{ .init(gpa), .init(gpa), .init(gpa) };
+    defer for (&mocks) |*t| t.deinit();
+
+    var e: Event = .init;
+    var woken: std.atomic.Value(u32) = .init(0);
+
+    const T = struct {
+        fn waiter(w_io: Io, ev: *Event, count: *std.atomic.Value(u32)) Cancelable!void {
+            try ev.wait(w_io);
+            _ = count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var groups: [3]Io.Group = .{ .init, .init, .init };
+    defer for (&groups, &mocks) |*g, *t| g.cancel(t.io());
+    for (&groups, &mocks) |*g, *t| {
+        g.concurrent(t.io(), T.waiter, .{ t.io(), &e, &woken }) catch return error.SkipZigTest;
+    }
+
+    // Both slots take one io each; wait until the third lands in overflow, so
+    // the wake must route through the overflow directory to reach it.
+    while (e.parker.overflow.load(.acquire) == null) std.atomic.spinLoopHint();
+    e.set(mocks[0].io());
+
+    for (&groups, &mocks) |*g, *t| try g.await(t.io());
+    try std.testing.expectEqual(3, woken.load(.monotonic));
+}
+
+test "condition broadcast across three incompatible ios" {
+    const gpa = std.testing.allocator;
+
+    var mocks: [3]TestIo = .{ .init(gpa), .init(gpa), .init(gpa) };
+    defer for (&mocks) |*t| t.deinit();
+
+    var m: Mutex = .init;
+    var cond: Condition = .init;
+    var ready = false;
+    var arrived: std.atomic.Value(u32) = .init(0);
+    var woken: std.atomic.Value(u32) = .init(0);
+
+    const T = struct {
+        fn waiter(w_io: Io, mtx: *Mutex, cnd: *Condition, flag: *bool, arr: *std.atomic.Value(u32), count: *std.atomic.Value(u32)) Cancelable!void {
+            try mtx.lock(w_io);
+            defer mtx.unlock(w_io);
+            _ = arr.fetchAdd(1, .monotonic);
+            while (!flag.*) try cnd.wait(w_io, mtx);
+            _ = count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var groups: [3]Io.Group = .{ .init, .init, .init };
+    defer for (&groups, &mocks) |*g, *t| g.cancel(t.io());
+    for (&groups, &mocks) |*g, *t| {
+        g.concurrent(t.io(), T.waiter, .{ t.io(), &m, &cond, &ready, &arrived, &woken }) catch return error.SkipZigTest;
+    }
+
+    while (arrived.load(.monotonic) < 3) std.atomic.spinLoopHint();
+    m.lockUncancelable(mocks[0].io());
+    ready = true;
+    m.unlock(mocks[0].io());
+    cond.broadcast(mocks[0].io());
+
+    for (&groups, &mocks) |*g, *t| try g.await(t.io());
+    try std.testing.expectEqual(3, woken.load(.monotonic));
 }
 
 test "mutex contention across incompatible ios" {
