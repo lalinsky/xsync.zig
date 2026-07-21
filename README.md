@@ -81,7 +81,7 @@ pub fn main() !void {
 ## Install
 
 ```
-zig fetch --save git+https://github.com/lalinsky/xsync.zig
+zig fetch --save "git+https://github.com/lalinsky/xsync.zig#v1.0.0"
 ```
 
 ```zig
