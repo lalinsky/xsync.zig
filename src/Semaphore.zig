@@ -138,6 +138,82 @@ test waitTimeout {
     try future.await(io);
 }
 
+test "post racing timeout never loses a permit" {
+    const io = testing.io;
+
+    const T = struct {
+        fn waiter(w_io: Io, sem: *Semaphore, got: *std.atomic.Value(bool)) Io.Cancelable!void {
+            sem.waitTimeout(w_io, .{ .duration = .{ .raw = .fromMicroseconds(100), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => return,
+                error.Canceled => |e| return e,
+            };
+            got.store(true, .seq_cst);
+        }
+    };
+
+    for (0..100) |_| {
+        var sem: Semaphore = .{};
+        var got: std.atomic.Value(bool) = .init(false);
+
+        var fut = io.concurrent(T.waiter, .{ io, &sem, &got }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return error.SkipZigTest,
+        };
+        sem.post(io);
+        fut.await(io) catch {};
+
+        // The permit was either consumed by the waiter or is still available.
+        sem.mutex.lockUncancelable(io);
+        const permits = sem.permits;
+        sem.mutex.unlock(io);
+        if (got.load(.seq_cst)) {
+            try testing.expectEqual(0, permits);
+        } else {
+            try testing.expectEqual(1, permits);
+        }
+    }
+}
+
+test "two ios: capacity invariant under stress" {
+    const gpa = testing.allocator;
+
+    var t1: Io.Threaded = .init(gpa, .{});
+    defer t1.deinit();
+    var t2: Io.Threaded = .init(gpa, .{});
+    defer t2.deinit();
+    const ios: [2]Io = .{ t1.io(), t2.io() };
+
+    var sem: Semaphore = .{ .permits = 2 };
+    var inside: std.atomic.Value(u32) = .init(0);
+    var over: std.atomic.Value(u32) = .init(0);
+
+    const T = struct {
+        fn worker(w_io: Io, s: *Semaphore, in_count: *std.atomic.Value(u32), ov: *std.atomic.Value(u32)) Io.Cancelable!void {
+            for (0..500) |_| {
+                try s.wait(w_io);
+                if (in_count.fetchAdd(1, .seq_cst) >= 2) _ = ov.fetchAdd(1, .monotonic);
+                std.atomic.spinLoopHint();
+                _ = in_count.fetchSub(1, .seq_cst);
+                s.post(w_io);
+            }
+        }
+    };
+
+    var groups: [2]Io.Group = .{ .init, .init };
+    defer for (&groups, ios) |*g, io| g.cancel(io);
+    for (&groups, ios) |*g, io| {
+        for (0..3) |_| {
+            g.concurrent(io, T.worker, .{ io, &sem, &inside, &over }) catch return error.SkipZigTest;
+        }
+    }
+    for (&groups, ios) |*g, io| try g.await(io);
+
+    try testing.expectEqual(0, over.load(.monotonic));
+    sem.mutex.lockUncancelable(ios[0]);
+    const permits = sem.permits;
+    sem.mutex.unlock(ios[0]);
+    try testing.expectEqual(2, permits);
+}
+
 test waitUncancelable {
     const io = testing.io;
 

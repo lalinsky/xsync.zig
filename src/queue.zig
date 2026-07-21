@@ -949,6 +949,24 @@ test "two ios: MPMC stress conserves elements" {
     }
 }
 
+test "timeout with partial progress returns count" {
+    const io = std.testing.io;
+
+    var buf: [4]u64 = undefined;
+    var q: Queue(u64) = .init(&buf);
+
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } };
+
+    // putTimeout: the buffer takes 4 of 8, then the deadline passes.
+    const vals: [8]u64 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try std.testing.expectEqual(4, try q.putTimeout(io, &vals, 8, timeout));
+
+    // getTimeout: receives the 4 buffered, min 6 stays out of reach.
+    var out: [8]u64 = undefined;
+    try std.testing.expectEqual(4, try q.getTimeout(io, &out, 6, timeout));
+    for (out[0..4], 1..) |v, i| try std.testing.expectEqual(i, v);
+}
+
 test "pending putter is woken before its servicer parks" {
     const io = std.testing.io;
 

@@ -353,3 +353,40 @@ test "waitTimeout times out" {
     const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } };
     try std.testing.expectError(error.Timeout, cond.waitTimeout(io, &m, timeout));
 }
+
+test "signal racing deadline leaves clean state" {
+    const io = std.testing.io;
+
+    const T = struct {
+        fn waiter(w_io: Io, mtx: *Mutex, cnd: *Condition, done: *std.atomic.Value(u32)) Cancelable!void {
+            try mtx.lock(w_io);
+            defer mtx.unlock(w_io);
+            const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMicroseconds(200), .clock = .awake } };
+            cnd.waitTimeout(w_io, mtx, timeout) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => |e| return e,
+            };
+            _ = done.fetchAdd(1, .monotonic);
+        }
+    };
+
+    // The signal lands before, during, or after the short wait; whatever the
+    // interleaving, the waiter must return and the state must drop to zero
+    // (a timed-out waiter may not strand a waiter count or a signal).
+    for (0..100) |_| {
+        var m: Mutex = .init;
+        var cond: Condition = .init;
+        var done: std.atomic.Value(u32) = .init(0);
+
+        var fut = io.concurrent(T.waiter, .{ io, &m, &cond, &done }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return error.SkipZigTest,
+        };
+        cond.signal(io);
+        fut.await(io) catch {};
+
+        try std.testing.expectEqual(1, done.load(.monotonic));
+        const st = cond.state.load(.monotonic);
+        try std.testing.expectEqual(0, st.waiters);
+        try std.testing.expectEqual(0, st.signals);
+    }
+}
