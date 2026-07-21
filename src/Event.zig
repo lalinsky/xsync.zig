@@ -36,7 +36,7 @@ pub fn wait(e: *Event, io: Io) Cancelable!void {
     defer e.parker.leave(ref);
 
     while (true) {
-        try io.futexWait(u32, &e.parker.word.raw, @intFromEnum(State.waiting));
+        try e.parker.wait(io, @intFromEnum(State.waiting));
         switch (e.load()) {
             .unset => unreachable, // reset called before pending wait returned
             .waiting => continue,
@@ -54,7 +54,7 @@ pub fn waitUncancelable(e: *Event, io: Io) void {
     defer e.parker.leave(ref);
 
     while (true) {
-        io.futexWaitUncancelable(u32, &e.parker.word.raw, @intFromEnum(State.waiting));
+        e.parker.waitUncancelable(io, @intFromEnum(State.waiting));
         switch (e.load()) {
             .unset => unreachable, // reset called before pending wait returned
             .waiting => continue,
@@ -76,7 +76,7 @@ pub fn waitTimeout(e: *Event, io: Io, timeout: Io.Timeout) WaitTimeoutError!void
     defer e.parker.leave(ref);
 
     while (true) {
-        try io.futexWaitTimeout(u32, &e.parker.word.raw, @intFromEnum(State.waiting), deadline);
+        try e.parker.waitTimeout(io, @intFromEnum(State.waiting), deadline);
         switch (e.load()) {
             .unset => unreachable, // reset called before pending wait returned
             .waiting => {},

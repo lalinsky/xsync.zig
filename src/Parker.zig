@@ -66,9 +66,9 @@ const Slot = struct {
     fn tryClaim(s: *Slot, io: Io) bool {
         if (s.count.cmpxchgStrong(0, claiming, .acquire, .monotonic) != null) return false;
         s.io = io;
-        // Seq_cst pairs with wake()'s directory scan: a waker that misses this
-        // store must have written the word late enough for our futex check to
-        // see it.
+        // Seq_cst pairs with wake()'s directory scan: a waker that misses
+        // this store has already written the word, so wait()'s pre-check
+        // sees it.
         s.count.store(1, .seq_cst);
         return true;
     }
@@ -108,8 +108,8 @@ pub fn enter(p: *Parker, node: *Node) Ref {
     defer Io.Threaded.mutexUnlock(&p.dir_lock);
     node.next = p.overflow.load(.monotonic);
     // Seq_cst for the same reason as tryClaim's count store: a waker whose
-    // null check misses this node must have written the word late enough
-    // for our futex check to see it.
+    // null check misses this node has already written the word, so wait()'s
+    // pre-check sees it.
     p.overflow.store(node, .seq_cst);
     return .{ .node = node };
 }
@@ -131,6 +131,29 @@ pub fn leave(p: *Parker, ref: Ref) void {
             }
         },
     }
+}
+
+/// Parks on the word through `io` while it still holds `expect`. The seq_cst
+/// pre-check pairs with `wake`'s directory scan: a waker whose scan missed
+/// this waiter's registration has already written the word, so the load sees
+/// it and we return instead of sleeping. This keeps the whole ordering
+/// argument inside the parker; the io's futexWait only needs the plain
+/// same-io wait/wake contract.
+pub fn wait(p: *Parker, io: Io, expect: u32) Io.Cancelable!void {
+    if (p.word.load(.seq_cst) != expect) return;
+    return io.futexWait(u32, &p.word.raw, expect);
+}
+
+/// Same as `wait` with a deadline.
+pub fn waitTimeout(p: *Parker, io: Io, expect: u32, deadline: Io.Timeout) Io.Cancelable!void {
+    if (p.word.load(.seq_cst) != expect) return;
+    return io.futexWaitTimeout(u32, &p.word.raw, expect, deadline);
+}
+
+/// Same as `wait`, but ignores cancellation.
+pub fn waitUncancelable(p: *Parker, io: Io, expect: u32) void {
+    if (p.word.load(.seq_cst) != expect) return;
+    io.futexWaitUncancelable(u32, &p.word.raw, expect);
 }
 
 /// Wakes up to `max_waiters` sleepers through every io that has some.

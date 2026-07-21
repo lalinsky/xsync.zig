@@ -56,7 +56,7 @@ pub fn waitTimeout(c: *Condition, io: Io, mutex: *Mutex, timeout: Io.Timeout) Wa
     defer mutex.lockUncancelable(io);
 
     while (true) {
-        const result = io.futexWaitTimeout(u32, &epoch_word.raw, epoch, deadline);
+        const result = c.parker.waitTimeout(io, epoch, deadline);
 
         epoch = epoch_word.load(.acquire); // `.acquire` to ensure ordered before `state` load
 
@@ -113,7 +113,7 @@ pub fn waitUncancelable(c: *Condition, io: Io, mutex: *Mutex) void {
     defer mutex.lockUncancelable(io);
 
     while (true) {
-        io.futexWaitUncancelable(u32, &epoch_word.raw, epoch);
+        c.parker.waitUncancelable(io, epoch);
 
         epoch = epoch_word.load(.acquire);
 

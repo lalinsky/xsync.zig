@@ -36,7 +36,7 @@ pub fn lock(m: *Mutex, io: Io) Cancelable!void {
     defer m.parker.leave(ref);
 
     while (m.parker.word.swap(contended, .acq_rel) != unlocked) {
-        try io.futexWait(u32, &m.parker.word.raw, contended);
+        try m.parker.wait(io, contended);
     }
 }
 
@@ -51,7 +51,7 @@ pub fn lockUncancelable(m: *Mutex, io: Io) void {
     defer m.parker.leave(ref);
 
     while (m.parker.word.swap(contended, .acq_rel) != unlocked) {
-        io.futexWaitUncancelable(u32, &m.parker.word.raw, contended);
+        m.parker.waitUncancelable(io, contended);
     }
 }
 
