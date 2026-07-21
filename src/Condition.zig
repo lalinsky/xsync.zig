@@ -252,6 +252,51 @@ test "broadcast wakes all" {
     try std.testing.expectEqual(3, woken.load(.monotonic));
 }
 
+test "three ios: broadcast reaches every io" {
+    const gpa = std.testing.allocator;
+
+    var t1: Io.Threaded = .init(gpa, .{});
+    defer t1.deinit();
+    var t2: Io.Threaded = .init(gpa, .{});
+    defer t2.deinit();
+    var t3: Io.Threaded = .init(gpa, .{});
+    defer t3.deinit();
+    const ios: [3]Io = .{ t1.io(), t2.io(), t3.io() };
+
+    var m: Mutex = .init;
+    var cond: Condition = .init;
+    var ready = false;
+    var arrived: std.atomic.Value(u32) = .init(0);
+    var woken: std.atomic.Value(u32) = .init(0);
+
+    const T = struct {
+        fn waiter(w_io: Io, mtx: *Mutex, cnd: *Condition, flag: *bool, arr: *std.atomic.Value(u32), count: *std.atomic.Value(u32)) Cancelable!void {
+            try mtx.lock(w_io);
+            defer mtx.unlock(w_io);
+            _ = arr.fetchAdd(1, .monotonic);
+            while (!flag.*) try cnd.wait(w_io, mtx);
+            _ = count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var groups: [3]Io.Group = .{ .init, .init, .init };
+    defer for (&groups, ios) |*g, io| g.cancel(io);
+    for (&groups, ios) |*g, io| {
+        g.concurrent(io, T.waiter, .{ io, &m, &cond, &ready, &arrived, &woken }) catch return error.SkipZigTest;
+    }
+
+    // Once all three have arrived under the mutex, taking the lock guarantees
+    // they have released into cond.wait (and thus queued).
+    while (arrived.load(.monotonic) < 3) std.atomic.spinLoopHint();
+    m.lockUncancelable(ios[0]);
+    ready = true;
+    m.unlock(ios[0]);
+    cond.broadcast(ios[0]);
+
+    for (&groups, ios) |*g, io| try g.await(io);
+    try std.testing.expectEqual(3, woken.load(.monotonic));
+}
+
 test "waitTimeout times out" {
     const io = std.testing.io;
 

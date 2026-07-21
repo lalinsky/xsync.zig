@@ -680,6 +680,124 @@ test "putTimeout on full queue times out" {
     try std.testing.expectEqual(1, try q.getOne(io));
 }
 
+test "two ios: producer/consumer" {
+    const gpa = std.testing.allocator;
+
+    var t1: Io.Threaded = .init(gpa, .{});
+    defer t1.deinit();
+    var t2: Io.Threaded = .init(gpa, .{});
+    defer t2.deinit();
+
+    var buf: [4]u64 = undefined;
+    var q: Queue(u64) = .init(&buf);
+    var sum: u64 = 0;
+
+    const T = struct {
+        fn producer(w_io: Io, qq: *Queue(u64)) Cancelable!void {
+            for (1..101) |i| qq.putOne(w_io, i) catch return;
+            qq.close(w_io);
+        }
+        fn consumer(w_io: Io, qq: *Queue(u64), total: *u64) Cancelable!void {
+            while (true) {
+                const v = qq.getOne(w_io) catch return;
+                total.* += v;
+            }
+        }
+    };
+
+    var pg: Io.Group = .init;
+    defer pg.cancel(t1.io());
+    var cg: Io.Group = .init;
+    defer cg.cancel(t2.io());
+    pg.concurrent(t1.io(), T.producer, .{ t1.io(), &q }) catch return error.SkipZigTest;
+    cg.concurrent(t2.io(), T.consumer, .{ t2.io(), &q, &sum }) catch return error.SkipZigTest;
+    try pg.await(t1.io());
+    try cg.await(t2.io());
+
+    try std.testing.expectEqual(5050, sum);
+}
+
+test "two ios: MPMC stress conserves elements" {
+    const gpa = std.testing.allocator;
+
+    var t1: Io.Threaded = .init(gpa, .{});
+    defer t1.deinit();
+    var t2: Io.Threaded = .init(gpa, .{});
+    defer t2.deinit();
+    const ios: [2]Io = .{ t1.io(), t2.io() };
+
+    const num_producers = 4;
+    const num_consumers = 4;
+    const per_producer = 1000;
+
+    var buf: [8]u64 = undefined;
+    var q: Queue(u64) = .init(&buf);
+    // seen[v] counts deliveries of value v; every element must arrive exactly once.
+    var seen: [num_producers * per_producer]std.atomic.Value(u8) = @splat(.init(0));
+
+    const T = struct {
+        fn producer(w_io: Io, qq: *Queue(u64), id: usize) Cancelable!void {
+            var prng = std.Random.DefaultPrng.init(std.testing.random_seed +% id);
+            const rnd = prng.random();
+            var vals: [per_producer]u64 = undefined;
+            for (&vals, 0..) |*v, i| v.* = id * per_producer + i;
+
+            var pos: usize = 0;
+            while (pos < per_producer) {
+                const len = @min(per_producer - pos, rnd.intRangeAtMost(usize, 1, 7));
+                const min = rnd.intRangeAtMost(usize, 1, len);
+                const n = qq.put(w_io, vals[pos..][0..len], min) catch |err| switch (err) {
+                    error.Closed => unreachable, // closed only after all producers finish
+                    error.Canceled => |e| return e,
+                };
+                pos += n;
+            }
+        }
+        fn consumer(w_io: Io, qq: *Queue(u64), marks: []std.atomic.Value(u8), dup: *std.atomic.Value(u32)) Cancelable!void {
+            var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+            const rnd = prng.random();
+            var out: [8]u64 = undefined;
+            while (true) {
+                const min = rnd.intRangeAtMost(usize, 1, out.len);
+                const n = qq.get(w_io, &out, min) catch |err| switch (err) {
+                    error.Closed => return,
+                    error.Canceled => |e| return e,
+                };
+                for (out[0..n]) |v| {
+                    if (marks[@intCast(v)].fetchAdd(1, .monotonic) != 0) {
+                        _ = dup.fetchAdd(1, .monotonic);
+                    }
+                }
+            }
+        }
+    };
+
+    var dup: std.atomic.Value(u32) = .init(0);
+    var producers: Io.Group = .init;
+    defer producers.cancel(ios[0]);
+    var consumers: Io.Group = .init;
+    defer consumers.cancel(ios[1]);
+
+    for (0..num_producers) |id| {
+        producers.concurrent(ios[0], T.producer, .{ ios[0], &q, id }) catch return error.SkipZigTest;
+    }
+    for (0..num_consumers) |_| {
+        consumers.concurrent(ios[1], T.consumer, .{ ios[1], &q, &seen, &dup }) catch return error.SkipZigTest;
+    }
+
+    try producers.await(ios[0]);
+    q.close(ios[0]);
+    try consumers.await(ios[1]);
+
+    try std.testing.expectEqual(0, dup.load(.monotonic));
+    for (&seen, 0..) |*s, v| {
+        if (s.load(.monotonic) != 1) {
+            std.debug.print("element {d} delivered {d} times (seed {d})\n", .{ v, s.load(.monotonic), std.testing.random_seed });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "pending putter is woken before its servicer parks" {
     const io = std.testing.io;
 

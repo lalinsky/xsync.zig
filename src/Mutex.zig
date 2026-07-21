@@ -104,3 +104,39 @@ test "concurrent counter" {
 
     try std.testing.expectEqual(4000, counter);
 }
+
+test "three ios: concurrent counter" {
+    const gpa = std.testing.allocator;
+
+    var t1: Io.Threaded = .init(gpa, .{});
+    defer t1.deinit();
+    var t2: Io.Threaded = .init(gpa, .{});
+    defer t2.deinit();
+    var t3: Io.Threaded = .init(gpa, .{});
+    defer t3.deinit();
+    const ios: [3]Io = .{ t1.io(), t2.io(), t3.io() };
+
+    var m: Mutex = .init;
+    var counter: u64 = 0;
+
+    const Worker = struct {
+        fn run(w_io: Io, mtx: *Mutex, ctr: *u64) Cancelable!void {
+            for (0..1000) |_| {
+                try mtx.lock(w_io);
+                ctr.* += 1;
+                mtx.unlock(w_io);
+            }
+        }
+    };
+
+    var groups: [3]Io.Group = .{ .init, .init, .init };
+    defer for (&groups, ios) |*g, io| g.cancel(io);
+    for (&groups, ios) |*g, io| {
+        for (0..2) |_| {
+            g.concurrent(io, Worker.run, .{ io, &m, &counter }) catch return error.SkipZigTest;
+        }
+    }
+    for (&groups, ios) |*g, io| try g.await(io);
+
+    try std.testing.expectEqual(6000, counter);
+}
