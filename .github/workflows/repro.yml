@@ -40,7 +40,7 @@ jobs:
       - run: |
           zig build \
             -Dfix-36178=${{ matrix.arm == 'fixed' }} \
-            -Drepro-rounds=2000 \
+            -Drepro-rounds=200 \
             -Drepro-iterations=10000 \
             ${{ matrix.abi == 'maccatalyst' && '-Dtarget=aarch64-maccatalyst-none -Dcpu=apple_m1' || '' }} \
             ${{ matrix.mode == 'release' && '-Doptimize=ReleaseSafe' || '' }}
@@ -50,13 +50,17 @@ jobs:
       - run: ./zig-out/bin/repro
         timeout-minutes: 15
 
-      # Same scenarios under the std test runner on `std.testing.io`, which is
-      # the harness zig's failing job actually used. No watchdog here, so a
-      # hang shows up as the step timeout — same signal zig's CI gave us.
-      - if: matrix.abi == 'native'
+      # zig's two tests verbatim (10_000 iterations each), under the std test
+      # runner on `std.testing.io` — the harness its failing job used. One
+      # binary per test, timed, repeated, because the open question is whether
+      # zig's 2m timeout was a deadlock or just an unaffordable runtime.
+      # Skipped for the control arm, where the leak test is meant to fail.
+      - if: matrix.arm == 'fixed'
         run: |
-          zig build repro-test --summary all \
-            -Dfix-36178=${{ matrix.arm == 'fixed' }} \
-            -Drepro-iterations=200000 \
-            ${{ matrix.mode == 'release' && '-Doptimize=ReleaseSafe' || '' }}
-        timeout-minutes: 15
+          for i in 1 2 3 4 5; do
+            for t in test-leak test-trylock; do
+              echo "--- run $i: $t"
+              /usr/bin/time -p ./zig-out/bin/$t
+            done
+          done
+        timeout-minutes: 20

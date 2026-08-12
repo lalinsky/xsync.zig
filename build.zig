@@ -48,19 +48,31 @@ pub fn build(b: *std.Build) void {
     const repro_step = b.step("repro", "Run the std.Io.RwLock cancelation hang reproducer");
     repro_step.dependOn(&run_repro.step);
 
-    // Same scenarios under the std test runner on `std.testing.io`, matching
-    // the harness zig's failing job used.
-    const repro_test_mod = b.createModule(.{
-        .root_source_file = b.path("repro/test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    repro_test_mod.addOptions("build_options", repro_options);
+    // zig's own two tests, verbatim, under the std test runner on
+    // `std.testing.io` — the harness its failing job used. One binary per test
+    // so each can be timed on its own; zig's `--test-timeout 2m` is per test.
+    const repro_test_step = b.step("repro-test", "Run zig's RwLock tests under the std test runner");
 
-    const repro_tests = b.addTest(.{ .root_module = repro_test_mod });
-    const run_repro_tests = b.addRunArtifact(repro_tests);
-    run_repro_tests.has_side_effects = true;
+    for ([_]struct { name: []const u8, filter: []const u8 }{
+        .{ .name = "test-leak", .filter = "canceled writer" },
+        .{ .name = "test-trylock", .filter = "tryLock" },
+    }) |t| {
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path("repro/test.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        test_mod.addOptions("build_options", repro_options);
 
-    const repro_test_step = b.step("repro-test", "Run the reproducer under the std test runner");
-    repro_test_step.dependOn(&run_repro_tests.step);
+        const tests = b.addTest(.{
+            .name = t.name,
+            .root_module = test_mod,
+            .filters = &.{t.filter},
+        });
+        b.installArtifact(tests);
+
+        const run = b.addRunArtifact(tests);
+        run.has_side_effects = true;
+        repro_test_step.dependOn(&run.step);
+    }
 }
