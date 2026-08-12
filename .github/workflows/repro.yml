@@ -1,0 +1,41 @@
+name: RwLock hang repro
+
+# Hunts the aarch64-macos hang from ziglang/zig CI on branch `rwlock-fixes`:
+#   'Io.RwLock.test.canceled writer does not leak a semaphore permit' timed out after 2m
+# Nothing to do with the xsync library itself; it runs verbatim copies of std's
+# Condition/Semaphore/RwLock so we can hammer a macOS runner we own.
+
+on:
+  push:
+    branches: [stdio-rwlock-hang-repro]
+  workflow_dispatch:
+
+jobs:
+  repro:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-13, ubuntu-24.04-arm, ubuntu-24.04]
+        mode: [debug, release]
+        # fixed = the candidate #36178 fix; control = without it, so we learn
+        # whether a hang predates the fix or is caused by it.
+        arm: [fixed, control]
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} ${{ matrix.mode }} ${{ matrix.arm }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: master
+      - run: uname -m && sysctl -n hw.ncpu 2>/dev/null || nproc
+      - run: |
+          zig build \
+            -Dfix-36178=${{ matrix.arm == 'fixed' }} \
+            -Drepro-rounds=2000 \
+            -Drepro-iterations=10000 \
+            ${{ matrix.mode == 'release' && '-Doptimize=ReleaseSafe' || '' }}
+      # The in-process watchdog dumps lock state and exits 1 after a 20s stall,
+      # so a genuine hang produces a diagnostic rather than a bare CI timeout.
+      # timeout-minutes is only a backstop for the watchdog itself wedging.
+      - run: ./zig-out/bin/repro
+        timeout-minutes: 15
