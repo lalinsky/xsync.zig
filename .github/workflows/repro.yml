@@ -4,6 +4,19 @@ name: RwLock hang repro
 #   'Io.RwLock.test.canceled writer does not leak a semaphore permit' timed out after 2m
 # Nothing to do with the xsync library itself; it runs verbatim copies of std's
 # Condition/Semaphore/RwLock so we can hammer a macOS runner we own.
+#
+# Established so far, on macos-latest (arm64, 3 cores):
+#   - 2000 rounds x 10000 iterations of the standalone stress never stalled,
+#     while the control arm leaked 84790 permits, so the reclaim path ran ~85k
+#     times and always returned. The fix does not deadlock.
+#   - zig's actual test takes 1.7s built natively but 11s built as
+#     `-Dtarget=aarch64-maccatalyst-none -Dcpu=apple_m1`, against zig's 2m
+#     per-test budget. That is the lead.
+#
+# This run separates the three variables that changed together in that 11s
+# build: the maccatalyst ABI, the explicit target, and -Dcpu=apple_m1. zig's
+# failing job is `std-aarch64-maccatalyst-none-apple_m1-debug`, so it uses an
+# explicit target and apple_m1 too.
 
 on:
   push:
@@ -11,51 +24,42 @@ on:
   workflow_dispatch:
 
 jobs:
-  repro:
+  timing:
     strategy:
       fail-fast: false
       matrix:
-        # macos-latest is arm64 (3 cores); macos-15-intel is the x86_64 one.
-        # macos-13 was retired by GitHub, so that label never schedules.
-        os: [macos-latest, macos-15-intel]
+        os: [macos-latest]
         mode: [debug, release]
-        # fixed = the candidate #36178 fix; control = without it, so we learn
-        # whether a hang predates the fix or is caused by it.
-        arm: [fixed, control]
-        # zig's failing job built for maccatalyst, not macos. Same arm of
-        # Threaded.futexWaitInner, but it is the one variable left that is
-        # cheap to isolate.
-        abi: [native, maccatalyst]
-        exclude:
-          - os: macos-15-intel
-            abi: maccatalyst
+        # native        = no -Dtarget, host CPU
+        # macos-explicit= explicit target + apple_m1, macos ABI
+        # maccatalyst   = explicit target + apple_m1, maccatalyst ABI
+        abi: [native, macos-explicit, maccatalyst]
     runs-on: ${{ matrix.os }}
-    name: ${{ matrix.os }} ${{ matrix.mode }} ${{ matrix.arm }} ${{ matrix.abi }}
+    name: ${{ matrix.os }} ${{ matrix.mode }} ${{ matrix.abi }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: master
-      - run: uname -m && sysctl -n hw.ncpu 2>/dev/null || nproc
-      - run: |
-          zig build \
-            -Dfix-36178=${{ matrix.arm == 'fixed' }} \
-            -Drepro-rounds=200 \
+      - run: uname -m && sysctl -n hw.ncpu && sysctl -n machdep.cpu.brand_string && sw_vers
+
+      - name: Build
+        run: |
+          case "${{ matrix.abi }}" in
+            native)         TARGET_FLAGS="" ;;
+            macos-explicit) TARGET_FLAGS="-Dtarget=aarch64-macos-none -Dcpu=apple_m1" ;;
+            maccatalyst)    TARGET_FLAGS="-Dtarget=aarch64-maccatalyst-none -Dcpu=apple_m1" ;;
+          esac
+          zig build $TARGET_FLAGS \
+            -Drepro-rounds=20 \
             -Drepro-iterations=10000 \
-            ${{ matrix.abi == 'maccatalyst' && '-Dtarget=aarch64-maccatalyst-none -Dcpu=apple_m1' || '' }} \
             ${{ matrix.mode == 'release' && '-Doptimize=ReleaseSafe' || '' }}
-      # The in-process watchdog dumps lock state and exits 1 after a 20s stall,
-      # so a genuine hang produces a diagnostic rather than a bare CI timeout.
-      # timeout-minutes is only a backstop for the watchdog itself wedging.
-      - run: ./zig-out/bin/repro
-        timeout-minutes: 15
 
       # zig's two tests verbatim (10_000 iterations each), under the std test
       # runner on `std.testing.io` — the harness its failing job used. One
-      # binary per test, timed, repeated, because the open question is whether
-      # zig's 2m timeout was a deadlock or just an unaffordable runtime.
-      # Skipped for the control arm, where the leak test is meant to fail.
-      - if: matrix.arm == 'fixed'
+      # binary per test so each is timed alone, matching zig's per-test
+      # `--test-timeout 2m`.
+      - name: Time zig's tests
         run: |
           for i in 1 2 3 4 5; do
             for t in test-leak test-trylock; do
@@ -64,3 +68,9 @@ jobs:
             done
           done
         timeout-minutes: 20
+
+      # Kept small: the stress already returned its negative, this is only a
+      # guard against the fix regressing into an actual deadlock.
+      - name: Stress (sanity)
+        run: ./zig-out/bin/repro
+        timeout-minutes: 10
