@@ -47,4 +47,20 @@ pub fn build(b: *std.Build) void {
 
     const repro_step = b.step("repro", "Run the std.Io.RwLock cancelation hang reproducer");
     repro_step.dependOn(&run_repro.step);
+
+    // Same scenarios under the std test runner on `std.testing.io`, matching
+    // the harness zig's failing job used.
+    const repro_test_mod = b.createModule(.{
+        .root_source_file = b.path("repro/test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    repro_test_mod.addOptions("build_options", repro_options);
+
+    const repro_tests = b.addTest(.{ .root_module = repro_test_mod });
+    const run_repro_tests = b.addRunArtifact(repro_tests);
+    run_repro_tests.has_side_effects = true;
+
+    const repro_test_step = b.step("repro-test", "Run the reproducer under the std test runner");
+    repro_test_step.dependOn(&run_repro_tests.step);
 }

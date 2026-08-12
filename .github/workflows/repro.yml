@@ -15,13 +15,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-13, ubuntu-24.04-arm, ubuntu-24.04]
+        # macos-latest is arm64 (3 cores); macos-15-intel is the x86_64 one.
+        # macos-13 was retired by GitHub, so that label never schedules.
+        os: [macos-latest, macos-15-intel]
         mode: [debug, release]
         # fixed = the candidate #36178 fix; control = without it, so we learn
         # whether a hang predates the fix or is caused by it.
         arm: [fixed, control]
+        # zig's failing job built for maccatalyst, not macos. Same arm of
+        # Threaded.futexWaitInner, but it is the one variable left that is
+        # cheap to isolate.
+        abi: [native, maccatalyst]
+        exclude:
+          - os: macos-15-intel
+            abi: maccatalyst
     runs-on: ${{ matrix.os }}
-    name: ${{ matrix.os }} ${{ matrix.mode }} ${{ matrix.arm }}
+    name: ${{ matrix.os }} ${{ matrix.mode }} ${{ matrix.arm }} ${{ matrix.abi }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -33,9 +42,21 @@ jobs:
             -Dfix-36178=${{ matrix.arm == 'fixed' }} \
             -Drepro-rounds=2000 \
             -Drepro-iterations=10000 \
+            ${{ matrix.abi == 'maccatalyst' && '-Dtarget=aarch64-maccatalyst-none -Dcpu=apple_m1' || '' }} \
             ${{ matrix.mode == 'release' && '-Doptimize=ReleaseSafe' || '' }}
       # The in-process watchdog dumps lock state and exits 1 after a 20s stall,
       # so a genuine hang produces a diagnostic rather than a bare CI timeout.
       # timeout-minutes is only a backstop for the watchdog itself wedging.
       - run: ./zig-out/bin/repro
+        timeout-minutes: 15
+
+      # Same scenarios under the std test runner on `std.testing.io`, which is
+      # the harness zig's failing job actually used. No watchdog here, so a
+      # hang shows up as the step timeout — same signal zig's CI gave us.
+      - if: matrix.abi == 'native'
+        run: |
+          zig build repro-test --summary all \
+            -Dfix-36178=${{ matrix.arm == 'fixed' }} \
+            -Drepro-iterations=200000 \
+            ${{ matrix.mode == 'release' && '-Doptimize=ReleaseSafe' || '' }}
         timeout-minutes: 15
