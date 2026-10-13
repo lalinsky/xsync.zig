@@ -10,6 +10,8 @@
 const std = @import("std");
 const Io = std.Io;
 const Threaded = Io.Threaded;
+// Zig 0.17 made `Threaded.mutexLock` cancelable and added `mutexLockUncancelable`.
+const mutexLock = if (@hasDecl(Threaded, "mutexLockUncancelable")) Threaded.mutexLockUncancelable else Threaded.mutexLock;
 const Cancelable = Io.Cancelable;
 const assert = std.debug.assert;
 
@@ -84,7 +86,7 @@ pub const TypeErasedQueue = struct {
         while (futex.load(.acquire) == 0) {
             io.futexWaitUncancelable(u32, &futex.raw, 0);
         }
-        Threaded.mutexLockUncancelable(&q.mutex);
+        mutexLock(&q.mutex);
     }
 
     pub fn init(buffer: []u8) TypeErasedQueue {
@@ -108,7 +110,7 @@ pub const TypeErasedQueue = struct {
     pub fn close(q: *TypeErasedQueue, io: Io) void {
         _ = io;
         var wakes: std.DoublyLinkedList = .{};
-        Threaded.mutexLockUncancelable(&q.mutex);
+        mutexLock(&q.mutex);
         q.closed = true;
         while (q.getters.first) |node| chainWake(&q.getters, &wakes, node);
         while (q.putters.first) |node| chainWake(&q.putters, &wakes, node);
@@ -132,7 +134,7 @@ pub const TypeErasedQueue = struct {
         try io.checkCancel();
         const deadline = timeout.toDeadline(io);
         var wakes: std.DoublyLinkedList = .{};
-        Threaded.mutexLockUncancelable(&q.mutex);
+        mutexLock(&q.mutex);
         const result = q.putLocked(io, elements, min, false, deadline, &wakes);
         Threaded.mutexUnlock(&q.mutex);
         drainWakes(&wakes);
@@ -146,7 +148,7 @@ pub const TypeErasedQueue = struct {
         assert(elements.len >= min);
         if (elements.len == 0) return 0;
         var wakes: std.DoublyLinkedList = .{};
-        Threaded.mutexLockUncancelable(&q.mutex);
+        mutexLock(&q.mutex);
         const result = q.putLocked(io, elements, min, true, .none, &wakes);
         Threaded.mutexUnlock(&q.mutex);
         drainWakes(&wakes);
@@ -221,7 +223,7 @@ pub const TypeErasedQueue = struct {
                 io.futexWaitUncancelable(u32, &pending.waiter.futex.raw, 0)
             else
                 io.futexWaitTimeout(u32, &pending.waiter.futex.raw, 0, deadline);
-            Threaded.mutexLockUncancelable(&q.mutex);
+            mutexLock(&q.mutex);
             result catch |err| switch (err) {
                 error.Canceled => {
                     if (!pending.waiter.queued) q.awaitWake(io, &pending.waiter.futex);
@@ -269,7 +271,7 @@ pub const TypeErasedQueue = struct {
         try io.checkCancel();
         const deadline = timeout.toDeadline(io);
         var wakes: std.DoublyLinkedList = .{};
-        Threaded.mutexLockUncancelable(&q.mutex);
+        mutexLock(&q.mutex);
         const result = q.getLocked(io, buffer, min, false, deadline, &wakes);
         Threaded.mutexUnlock(&q.mutex);
         drainWakes(&wakes);
@@ -283,7 +285,7 @@ pub const TypeErasedQueue = struct {
         assert(buffer.len >= min);
         if (buffer.len == 0) return 0;
         var wakes: std.DoublyLinkedList = .{};
-        Threaded.mutexLockUncancelable(&q.mutex);
+        mutexLock(&q.mutex);
         const result = q.getLocked(io, buffer, min, true, .none, &wakes);
         Threaded.mutexUnlock(&q.mutex);
         drainWakes(&wakes);
@@ -367,7 +369,7 @@ pub const TypeErasedQueue = struct {
                 io.futexWaitUncancelable(u32, &pending.waiter.futex.raw, 0)
             else
                 io.futexWaitTimeout(u32, &pending.waiter.futex.raw, 0, deadline);
-            Threaded.mutexLockUncancelable(&q.mutex);
+            mutexLock(&q.mutex);
             result catch |err| switch (err) {
                 error.Canceled => {
                     if (!pending.waiter.queued) q.awaitWake(io, &pending.waiter.futex);
@@ -682,7 +684,7 @@ test "putTimeout on full queue times out" {
 
 fn waitParked(q: *TypeErasedQueue, list: enum { getters, putters }) void {
     while (true) {
-        Threaded.mutexLockUncancelable(&q.mutex);
+        mutexLock(&q.mutex);
         const parked = switch (list) {
             .getters => q.getters.first != null,
             .putters => q.putters.first != null,
@@ -998,7 +1000,7 @@ test "pending putter is woken before its servicer parks" {
     // Wait until the producer is parked with a pending element, so the
     // consumer both completes it and then pends itself.
     while (true) {
-        Threaded.mutexLockUncancelable(&q.type_erased.mutex);
+        mutexLock(&q.type_erased.mutex);
         const parked = q.type_erased.putters.first != null;
         Threaded.mutexUnlock(&q.type_erased.mutex);
         if (parked) break;

@@ -8,6 +8,8 @@
 
 const std = @import("std");
 const Io = std.Io;
+// Zig 0.17 made `Threaded.mutexLock` cancelable and added `mutexLockUncancelable`.
+const mutexLock = if (@hasDecl(Io.Threaded, "mutexLockUncancelable")) Io.Threaded.mutexLockUncancelable else Io.Threaded.mutexLock;
 
 const Parker = @This();
 
@@ -104,7 +106,7 @@ pub fn enter(p: *Parker, node: *Node) Ref {
         std.atomic.spinLoopHint();
     }
 
-    Io.Threaded.mutexLockUncancelable(&p.dir_lock);
+    mutexLock(&p.dir_lock);
     defer Io.Threaded.mutexUnlock(&p.dir_lock);
     node.next = p.overflow.load(.monotonic);
     // Seq_cst for the same reason as tryClaim's count store: a waker whose
@@ -118,7 +120,7 @@ pub fn leave(p: *Parker, ref: Ref) void {
     switch (ref) {
         .slot => |s| s.unpin(),
         .node => |n| {
-            Io.Threaded.mutexLockUncancelable(&p.dir_lock);
+            mutexLock(&p.dir_lock);
             defer Io.Threaded.mutexUnlock(&p.dir_lock);
             var cur = p.overflow.load(.monotonic);
             if (cur == n) {
@@ -174,7 +176,7 @@ pub fn wake(p: *Parker, max_waiters: u32) void {
     var len: usize = 0;
     var rest = false;
     {
-        Io.Threaded.mutexLockUncancelable(&p.dir_lock);
+        mutexLock(&p.dir_lock);
         defer Io.Threaded.mutexUnlock(&p.dir_lock);
         var cur = p.overflow.load(.monotonic);
         outer: while (cur) |n| : (cur = n.next) {
@@ -191,7 +193,7 @@ pub fn wake(p: *Parker, max_waiters: u32) void {
     }
     for (ios[0..len]) |io| io.futexWake(u32, &p.word.raw, max_waiters);
     if (rest) {
-        Io.Threaded.mutexLockUncancelable(&p.dir_lock);
+        mutexLock(&p.dir_lock);
         defer Io.Threaded.mutexUnlock(&p.dir_lock);
         var cur = p.overflow.load(.monotonic);
         while (cur) |n| : (cur = n.next) {

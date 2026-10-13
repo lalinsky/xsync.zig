@@ -9,6 +9,8 @@
 
 const std = @import("std");
 const Io = std.Io;
+// Zig 0.17 made `Threaded.mutexLock` cancelable and added `mutexLockUncancelable`.
+const mutexLock = if (@hasDecl(Io.Threaded, "mutexLockUncancelable")) Io.Threaded.mutexLockUncancelable else Io.Threaded.mutexLock;
 
 const TestIo = @This();
 
@@ -55,7 +57,7 @@ fn fromUserdata(userdata: ?*anyopaque) *TestIo {
 /// contract requires; the kernel futex on the proxy covers the gap between
 /// unlocking and actually sleeping.
 fn prepare(t: *TestIo, ptr: *const u32, expected: u32) ?struct { proxy: *Proxy, seq: u32 } {
-    Io.Threaded.mutexLockUncancelable(&t.table_lock);
+    mutexLock(&t.table_lock);
     defer Io.Threaded.mutexUnlock(&t.table_lock);
     if (@atomicLoad(u32, ptr, .seq_cst) != expected) return null;
     const addr = @intFromPtr(ptr);
@@ -83,7 +85,7 @@ fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) 
 fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
     const t = fromUserdata(userdata);
     const addr = @intFromPtr(ptr);
-    Io.Threaded.mutexLockUncancelable(&t.table_lock);
+    mutexLock(&t.table_lock);
     const proxy = for (&t.proxies) |*p| {
         if (p.addr == addr) break p;
         if (p.addr == 0) break null;

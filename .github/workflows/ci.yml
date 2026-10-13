@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        zig: ["0.16.0", "master"]
+        zig: ["0.16.0", "0.17.0"]
         mode: [debug, release]
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}

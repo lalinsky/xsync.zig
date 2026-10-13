@@ -101,7 +101,7 @@ exe.root_module.addImport("xsync", xsync);
 - Don't deinit an `Io` while other tasks may still be waking primitives that
   its tasks parked on.
 
-Tested on Zig 0.16 and master.
+Tested on Zig 0.16 and 0.17.
 
 ## Zig bug reports
 
